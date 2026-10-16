@@ -52,7 +52,12 @@ class MainActivity : ComponentActivity() {
                             putExtra(WebRtcService.INTENT, WebRtcState.state.value.intent.name)
                         })
                     } catch (e: Exception) { WebRtcState.set(WebRtcUi(status = "Start error: ${e.message}")) }
-                } else WebRtcState.set(WebRtcUi(status = "Sharing cancelled"))
+                } else {
+                    entering = false
+                    scanning = false
+                    joinCode = ""
+                    WebRtcState.cancelConsent()
+                }
             }
             val launchMediaProjectionConsent: (String, PairingIntent) -> Unit = { code, intent ->
                 WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing", pairingCode = code, intent = intent))

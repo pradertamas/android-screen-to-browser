@@ -23,6 +23,9 @@ object WebRtcState {
     private val mutable = MutableStateFlow(WebRtcUi())
     val state = mutable.asStateFlow()
     fun set(value: WebRtcUi) { mutable.value = value }
+    // Consent precedes service/capture/signaling startup. Reset only the pending UI;
+    // never start a service just to stop a session that has not registered yet.
+    fun cancelConsent() { set(WebRtcUi(status = "Sharing cancelled")) }
 }
 
 /** Owns exactly one fresh consent token, texture capturer and sender peer. All control is serialized. */
