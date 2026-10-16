@@ -1,0 +1,19 @@
+﻿# PoC 3B measurement notes
+
+The existing MediaProjection / VirtualDisplay / RGBA ImageReader and explicit PNG path remain in use.
+
+- All measurements use elapsedRealtimeNanos (monotonic, includes device sleep).
+- Session begins immediately before createVirtualDisplay and ends at worker-thread stop handling, before resource cleanup. Duration includes hidden/unknown visibility and PNG work. Average FPS = acquired images / session seconds. acquireLatestImage can discard queued images: these are consumer-observed rates, not compositor or producer FPS.
+- A worker Handler publishes immutable snapshots about once per second, even if no images arrive. Recent FPS is the acquired-image count delta divided by actual time since the previous >=1-second window boundary. It is zero until the first full window; after stop it retains the last completed window.
+- Gaps use timestamps immediately after successful acquireLatestImage. First image has no gap. Average divides the sum by frames-1. Threshold counters are strict and cumulative (a 1100ms gap increments all five). Maximum gap counts completed intervals only. Last-frame age shows an ongoing silence (or waiting since session start before the first image). Static content can legitimately deliver few frames; a gap alone is not proof of failure.
+- Each image samples RGB at the centers of a fixed 16x16 grid inside cropRect, respecting pixelStride, rowStride and buffer position. 256 pixels / 768 byte reads are compared exactly against the prior sample in two reused IntArrays (~2 KiB total). No hashing, full-frame copy, per-frame Bitmap or PNG is involved. Plane/crop access can still have platform costs, measured on the device.
+- One changed sampled RGB component marks a changed frame. The first frame and first frame after ImageReader resize are reference frames excluded from changed percentage. Therefore changed + unchanged + references = acquired frames. Changes outside sample points are missed; tiny noise can count as change; alpha-only changes are ignored. This is not a measure of perceptual novelty or guaranteed full-image equality.
+- Processing time starts just before acquireLatestImage and ends after prior-image close, metadata, sampling, and frame-statistics updates. It excludes queue waiting, UI snapshot publication, explicit PNG work and the timing-counter update itself. Empty callbacks are not processing samples. Double sums avoid integer accumulation overflow; timestamps, counts and differences use Long.
+- Image ownership remains worker-confined: one acquired image is retained for explicit save, closed on replacement/resize/stop. maxImages=3 leaves two slots available for acquireLatestImage. Sampling uses absolute reads without changing buffer position.
+- Visibility durations accumulate true/false/unknown intervals. The first known value is not a change; subsequent actual true/false transitions are counted. Initial selection, app switching and returning to the test UI can affect results.
+- PNG encoding/diagnostics run on the same worker as before. They deliberately block capture consumption and can increase gaps; sample-save attempt count marks sessions affected by this. For the baseline performance run do not save PNGs.
+- Stop freezes the summary; Start resets it. No per-frame logs or metric export are added. Existing visibility/resize and explicit sample diagnostics remain.
+
+## Physical run
+
+Run a fresh 2-5 minute single-app Waze session with changing map content, no PNG saves and Waze foreground throughout. Stop using the system sharing control while still in Waze if possible, then return to read the frozen summary. A separate run should test static content, hiding/showing the shared app, explicit PNG saves, stop and restart. Return all summary values, duration, observed interruptions, visibility history/context and whether any sample saves occurred.
