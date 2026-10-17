@@ -38,10 +38,15 @@ import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
     private var externalUi = false
+    private var remoteSharing = false
     private var consentEpoch = -1L
     private fun openReceiver() {
         try { startActivity(Intent(this, ReceiverActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
         catch (_: Exception) { AppMediaRoles.receiverStartFailed() }
+    }
+    override fun onResume() {
+        super.onResume()
+        if (remoteSharing) { remoteSharing = false; externalUi = false }
     }
     override fun onStart() {
         super.onStart()
@@ -50,16 +55,19 @@ class MainActivity : ComponentActivity() {
     }
     override fun onStop() { if (!externalUi) PairingHost.controller.hide(); super.onStop() }
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("remoteSharing", remoteSharing)
         outState.putLong("consentEpoch", consentEpoch)
         outState.putBoolean("externalUi", externalUi)
         super.onSaveInstanceState(outState)
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
+        overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)
         PairingHost.initialize(this)
         consentEpoch = savedInstanceState?.getLong("consentEpoch", -1L) ?: -1L
         externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
-        val appPairing = ViewModelProvider(this)[AppPairingViewModel::class.java]
+        remoteSharing = savedInstanceState?.getBoolean("remoteSharing", false) ?: false
         enableEdgeToEdge()
         setContent {
             val state by CaptureState.state.collectAsState()
@@ -137,11 +145,28 @@ class MainActivity : ComponentActivity() {
                         Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                         MediaRoleSelector(mediaMode.role,
                             MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning) { requested ->
-                            if (AppMediaRoles.switchRole(requested) && requested == MediaRole.RECEIVE) openReceiver()
+                            if (requested != mediaMode.role && AppMediaRoles.switchRole(requested)) {
+                                selectedPath = null; joinCode = ""
+                                if (requested == MediaRole.RECEIVE) openReceiver()
+                            }
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
-                        if (!rtc.busy) WorkflowStart(appPairing, canChoose, selectedPath) { selectedPath = it }
+                        if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = {
+                            try {
+                                val share = Intent(Intent.ACTION_SEND).apply {
+                                    type = RemoteDevice.MIME_TYPE
+                                    putExtra(Intent.EXTRA_SUBJECT, RemoteDevice.SUBJECT)
+                                    putExtra(Intent.EXTRA_TEXT, PairingHost.remoteShareText())
+                                }
+                                remoteSharing = true; externalUi = true
+                                startActivity(Intent.createChooser(share, "Share connection link"))
+                            } catch (_: Exception) {
+                                remoteSharing = false; externalUi = false
+                                remoteFeedback = "Link could not be shared. Please try again."
+                            }
+                        }) { selectedPath = it }
+                        if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
                         val activePath = selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
                             if (home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
                         } else null
@@ -214,22 +239,15 @@ class MainActivity : ComponentActivity() {
                             if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
                                 startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
                             }) { Text("Stop") }
-                            if (activePath == ConnectionWorkflow.SHOW && !rtc.busy) {
+                        }
+
+                        TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
+                        if (diagnostics) {
                         HorizontalDivider()
                         Text("Remote connection", style = MaterialTheme.typography.titleMedium)
                         Text("Use this link when the receiving device is far away.")
                         Text(remoteFeedback)
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(modifier = Modifier.fillMaxWidth(), onClick = {
-                                try {
-                                    val share = Intent(Intent.ACTION_SEND).apply {
-                                        type = RemoteDevice.MIME_TYPE
-                                        putExtra(Intent.EXTRA_SUBJECT, RemoteDevice.SUBJECT)
-                                        putExtra(Intent.EXTRA_TEXT, PairingHost.remoteShareText())
-                                    }
-                                    startActivity(Intent.createChooser(share, "Share link"))
-                                } catch (_: Exception) { remoteFeedback = "Link could not be shared. Please try again." }
-                            }) { Text("Share connection link") }
                             Button(modifier = Modifier.fillMaxWidth(), onClick = {
                                 try {
                                     val clip = ClipData.newPlainText("Screen sharing link", PairingHost.remoteLink())
@@ -251,10 +269,7 @@ class MainActivity : ComponentActivity() {
                                 catch (_: Exception) { remoteFeedback = "Link could not be replaced. Please try again." }
                             }) { Text("Regenerate") } },
                             dismissButton = { TextButton(onClick = { regenerateRemote = false }) { Text("Cancel") } })
-                            }
-                        }
-                        TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
-                        if (diagnostics) {
+
                         Text("Media role: "+mediaMode.role.name)
                         Text("WebRTC diagnostics", style = MaterialTheme.typography.titleMedium)
                         Text(rtc.metrics)

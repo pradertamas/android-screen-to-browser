@@ -1,6 +1,8 @@
-﻿package com.pradertamas.uicapturetest
+package com.pradertamas.uicapturetest
 
 import android.os.Bundle
+import android.app.Activity
+import androidx.activity.enableEdgeToEdge
 import android.content.Intent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -57,6 +59,9 @@ class ReceiverActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
+        overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        enableEdgeToEdge()
         if (AppMediaRoles.role != MediaRole.RECEIVE) {
             // Process recreation defaults to SEND; never infer RECEIVE from the restored Activity type.
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
@@ -71,7 +76,6 @@ class ReceiverActivity : ComponentActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }
         })
-        val appPairing = ViewModelProvider(this)[AppPairingViewModel::class.java]
         setContent {
             val connectionShare = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { sharingLink = false }
             val ui by model.state.collectAsState()
@@ -104,7 +108,7 @@ class ReceiverActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxSize())
                             if (phase != ReceiverPhase.RECEIVING) {
                                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
-                                    .padding(20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    .padding(24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                     Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                                     Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                                     MediaRoleSelector(mediaMode.role, MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning) { requested ->
@@ -112,7 +116,16 @@ class ReceiverActivity : ComponentActivity() {
                                     }
                                     if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                                     val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
-                                    WorkflowStart(appPairing, canChoose, selectedPath) { selectedPath = it }
+                                    WorkflowStart(canChoose, selectedPath, share = {
+                                        try {
+                                            val url = PairingCode.receiverUrl(ui.home.code)
+                                            sharingLink = true
+                                            connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
+                                            }, "Share connection link"))
+                                        } catch (_: Exception) { sharingLink = false; error = "Link could not be shared. Please try again." }
+                                    }, shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE) { selectedPath = it }
+                                    if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     val activePath = selectedPath ?: if (phase == ReceiverPhase.CONNECTING) {
                                         if (ui.home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
                                     } else null

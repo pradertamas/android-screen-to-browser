@@ -12,8 +12,9 @@ class ConnectionWorkflowTest {
         assertEquals("3. Connect to another device", ConnectionWorkflow.title(ConnectionWorkflow.CONNECT))
         assertEquals("3. Let another device connect here", ConnectionWorkflow.title(ConnectionWorkflow.SHOW))
         val ui = text("ConnectionWorkflow.kt")
-        assertTrue(ui.indexOf("Saved connections") < ui.indexOf("WorkflowAction(\"Connect to another device"))
-        assertTrue(ui.indexOf("AppPairingSection(model, allowed, compact = true)") < ui.indexOf("Saved connections"))
+        assertFalse(ui.contains("Saved connections")); assertFalse(ui.contains("Manage saved connections"))
+        assertFalse(ui.contains("AppPairing")); assertFalse(ui.contains("refreshDevices"))
+        assertTrue(ui.indexOf("Text(\"Share connection link\")") < ui.indexOf("WorkflowAction(\"Connect to another device"))
         assertTrue(ui.indexOf("WorkflowAction(\"Connect to another device") < ui.indexOf("WorkflowAction(\"Let another device connect here"))
         val inviteUi = text("AppPairingSection.kt")
         assertFalse(inviteUi.contains("Manage saved connections")); assertFalse(inviteUi.contains("expanded"))
@@ -25,10 +26,37 @@ class ConnectionWorkflowTest {
         assertFalse(ui.contains("startForegroundService(")); assertFalse(ui.contains("model.join("))
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
             val activity = text(name)
-            assertTrue(activity.contains("1. Choose role")); assertTrue(activity.contains("WorkflowStart(appPairing"))
+            assertTrue(activity.contains("1. Choose role")); assertTrue(activity.contains("WorkflowStart(canChoose"))
             assertTrue(activity.contains("WorkflowPanel(activePath")); assertTrue(activity.contains("selectedPath = null"))
             assertTrue(activity.contains("MediaRoleSelector(mediaMode.role")); assertTrue(activity.contains("Advanced diagnostics"))
         }
+    }
+    @Test fun mainShareUsesRemoteLinkAndReceiverUsesItsSessionWithoutNas() {
+        val main = text("MainActivity.kt")
+        val receiver = text("ReceiverActivity.kt")
+        for (activity in listOf(main, receiver)) {
+            assertFalse(activity.contains("AppPairing"))
+            assertTrue(activity.contains("Intent.ACTION_SEND")); assertTrue(activity.contains("Intent.createChooser"))
+            assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)"))
+            assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)"))
+            assertTrue(activity.contains("padding(24.dp)"))
+        }
+        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("val activePath")
+        assertTrue(topShare.contains("PairingHost.remoteShareText()"))
+        assertTrue(topShare.contains("startActivity(Intent.createChooser"))
+        assertFalse(topShare.contains("createScreenCaptureIntent")); assertFalse(topShare.contains("controller.join"))
+        assertTrue(receiver.substringAfter("WorkflowStart(canChoose").substringBefore("val activePath").contains("PairingCode.receiverUrl(ui.home.code)"))
+        val roleSwitch = main.substringAfter("if (requested != mediaMode.role").substringBefore("if (mediaMode.error")
+        assertTrue(roleSwitch.contains("AppMediaRoles.switchRole(requested)"))
+        assertTrue(roleSwitch.contains("selectedPath = null; joinCode = \"\""))
+        assertFalse(roleSwitch.contains("createScreenCaptureIntent"))
+        assertTrue(receiver.contains("shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE"))
+        val selector = text("MediaRoleSelector.kt")
+        assertTrue(selector.contains("activeContainerColor = Color(0xFF245C3A)"))
+        assertTrue(selector.contains("inactiveContainerColor = MaterialTheme.colorScheme.surface"))
+        assertTrue(selector.contains("selected = role == value"))
+        assertTrue(selector.contains("heightIn(min = 56.dp)"))
+        assertTrue(text("PairingInviteActivity.kt").contains("AppPairingSection"))
     }
     @Test fun onlyValidPublicDeviceIdentifiersCanBeDisplayed() {
         val id = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(16) { 7 })
@@ -38,7 +66,7 @@ class ConnectionWorkflowTest {
         assertNull(PairedDevice.fromPublicId(credential)); assertNull(PairedDevice.fromPublicId(id + "="))
         assertTrue(emptyList<PairedDevice>().isEmpty())
         val ui = text("ConnectionWorkflow.kt")
-        assertTrue(ui.contains("if (devices.isNotEmpty())")); assertTrue(ui.contains("device.publicId.takeLast(8)"))
+        assertFalse(ui.contains("device.publicId")); assertFalse(ui.contains("devices.forEach"))
         assertFalse(ui.contains("device.credential")); assertFalse(ui.contains("Galaxy S25"))
     }
     @Test fun listRefreshDoesNotCreateOrReplaceDeviceIdentity() {

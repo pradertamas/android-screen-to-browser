@@ -4,8 +4,6 @@ import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.os.PersistableBundle
-import androidx.activity.ComponentActivity
-import androidx.lifecycle.Lifecycle
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -27,31 +25,13 @@ object ConnectionWorkflow {
 }
 
 @Composable
-fun WorkflowStart(model: AppPairingViewModel, allowed: Boolean, path: String?, select: (String) -> Unit) {
-    val devices by model.devices.collectAsState()
-    val message by model.devicesMessage.collectAsState()
-    val pairing by model.state.collectAsState()
-    val lifecycle = (LocalContext.current as? ComponentActivity)?.lifecycle?.currentStateFlow?.collectAsState()?.value
-    LaunchedEffect(pairing.phase, lifecycle) {
-        if (lifecycle == Lifecycle.State.RESUMED && pairing.phase in setOf(AppPairingPhase.IDLE, AppPairingPhase.PAIRED)) model.refreshDevices()
-    }
+fun WorkflowStart(allowed: Boolean, path: String?, share: () -> Unit, shareEnabled: Boolean = allowed, select: (String) -> Unit) {
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("2. Choose how to start", style = MaterialTheme.typography.titleMedium)
-            AppPairingSection(model, allowed, compact = true)
-            if (devices.isNotEmpty()) {
-                Text("Saved connections", style = MaterialTheme.typography.titleSmall)
-                devices.forEach { device ->
-                    // No direct media-session bridge or friendly name exists in this client.
-                    OutlinedCard(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("Device " + device.publicId.takeLast(8))
-                            Text("Saved connection. Use a QR or code to start sharing.", style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
+            Button(onClick = share, enabled = shareEnabled, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                Text("Share connection link")
             }
-            if (message.isNotEmpty()) Text(message, style = MaterialTheme.typography.bodySmall)
             WorkflowAction("Connect to another device", "Use a QR code or enter a code from another device.", path == ConnectionWorkflow.CONNECT, allowed) { select(ConnectionWorkflow.CONNECT) }
             WorkflowAction("Let another device connect here", "Show a QR code or connection code on this device.", path == ConnectionWorkflow.SHOW, allowed) { select(ConnectionWorkflow.SHOW) }
         }
