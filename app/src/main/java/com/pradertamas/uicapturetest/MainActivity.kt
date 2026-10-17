@@ -81,7 +81,6 @@ class MainActivity : ComponentActivity() {
             var joinCode by rememberSaveable { mutableStateOf("") }
             var regenerateRemote by remember { mutableStateOf(false) }
             var remoteFeedback by remember { mutableStateOf("Remote link ready") }
-            val connectionShare = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { externalUi = false }
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 externalUi = false
                 val data = result.data
@@ -139,8 +138,14 @@ class MainActivity : ComponentActivity() {
             }
             UICaptureTestTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    Column(Modifier.padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),
+                        val activePath = selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
+                            if (home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
+                        } else null
+                    val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
+                    Column(Modifier.padding(padding).padding(24.dp).verticalScroll(taskScroll),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
+                        if (activePath == null) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                         Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                         MediaRoleSelector(mediaMode.role,
@@ -151,7 +156,6 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                        val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
                         if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = {
                             try {
                                 val share = Intent(Intent.ACTION_SEND).apply {
@@ -167,20 +171,12 @@ class MainActivity : ComponentActivity() {
                             }
                         }) { selectedPath = it }
                         if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
-                        val activePath = selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
-                            if (home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
-                        } else null
+                        }
                         if (activePath != null) WorkflowPanel(activePath, canChoose, {
                             PairingHost.controller.typed(""); joinCode = ""; selectedPath = null
                         }) {
                             if (activePath == ConnectionWorkflow.SHOW && home.code.isNotEmpty() && home.intent == PairingIntent.CREATE && !rtc.busy) {
-                                WorkflowOwnCode(home.code) { url ->
-                                    externalUi = true
-                                    try { connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
-                                    }, "Share connection link")) } catch (error: Exception) { externalUi = false; throw error }
-                                }
-                                Text("Scan this QR from the receiving device or enter the code there.")
+                                WorkflowOwnCode(home.code)
                             }
                             if (activePath == ConnectionWorkflow.CONNECT && PairingHost.controller.editable() && !rtc.busy) {
                             Button(enabled = !state.busy && !scanning, onClick = {
@@ -212,7 +208,6 @@ class MainActivity : ComponentActivity() {
                                     }
                                 } catch (_: Exception) { scanning = false; externalUi = false; PairingHost.controller.notice("Camera is not available. Enter the connection code instead.") }
                             }) { Text(if (scanning) "Scanning..." else "Scan QR code") }
-                            Text("OR", style = MaterialTheme.typography.labelMedium)
                             OutlinedTextField(value = joinCode, onValueChange = { value ->
                                 val normalized = AutoPairing.input(value)
                                 if (normalized != null) {
@@ -229,18 +224,19 @@ class MainActivity : ComponentActivity() {
                                 else PairingHost.controller.notice("Invalid connection code")
                             }) { Text("Connect") }
                             }
-                            Text(if (home.phase == PairingPhase.STREAMING) "Sharing your screen" else when (home.phase) {
+                            if (rtc.busy) Text(if (home.phase == PairingPhase.STREAMING) "Sharing your screen" else when (home.phase) {
                                 PairingPhase.CREATING, PairingPhase.WAITING -> "Waiting for another device..."
                                 PairingPhase.CONSENT -> "Allow screen sharing"
                                 PairingPhase.STOPPED, PairingPhase.ERROR -> "Getting ready..."
                                 else -> "Connecting..."
                             }, style = MaterialTheme.typography.bodyLarge)
-                            if (home.notice.isNotEmpty()) Text(ConnectionWorkflow.displayStatus(home.notice))
+                            if (activePath == ConnectionWorkflow.CONNECT && home.notice.isNotEmpty()) Text(ConnectionWorkflow.displayStatus(home.notice))
                             if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
                                 startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
                             }) { Text("Stop") }
                         }
 
+                        if (activePath == null) {
                         TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
                         if (diagnostics) {
                         HorizontalDivider()
@@ -319,6 +315,7 @@ class MainActivity : ComponentActivity() {
                         Text("Saved sample:\n${state.path.ifEmpty { "-" }}")
                         if (state.diagnostic.isNotEmpty()) Text(state.diagnostic)
                         if (state.saveError.isNotEmpty()) Text(state.saveError)
+                        }
                         }
 
                     }

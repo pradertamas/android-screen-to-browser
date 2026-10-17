@@ -83,6 +83,10 @@ class ReceiverActivity : ComponentActivity() {
             val phase = ui.home.phase
             var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var code by rememberSaveable { mutableStateOf("") }
+            val activePath = selectedPath ?: if (phase == ReceiverPhase.CONNECTING) {
+                if (ui.home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
+            } else null
+            val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
             var diagnostics by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf("") }
             LaunchedEffect(phase) {
@@ -108,14 +112,15 @@ class ReceiverActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxSize())
                             if (phase != ReceiverPhase.RECEIVING) {
                                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
-                                    .padding(24.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    .padding(24.dp).verticalScroll(taskScroll), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
+                                    if (activePath == null) {
                                     Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                                     Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                                     MediaRoleSelector(mediaMode.role, MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning) { requested ->
                                         if (requested == MediaRole.SEND) returnToSend()
                                     }
                                     if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                                    val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
                                     WorkflowStart(canChoose, selectedPath, share = {
                                         try {
                                             val url = PairingCode.receiverUrl(ui.home.code)
@@ -126,23 +131,14 @@ class ReceiverActivity : ComponentActivity() {
                                         } catch (_: Exception) { sharingLink = false; error = "Link could not be shared. Please try again." }
                                     }, shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE) { selectedPath = it }
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
-                                    val activePath = selectedPath ?: if (phase == ReceiverPhase.CONNECTING) {
-                                        if (ui.home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
-                                    } else null
+                                    }
                                     if (activePath != null) WorkflowPanel(activePath, canChoose, { code = ""; error = ""; selectedPath = null }) {
                                         if (phase == ReceiverPhase.PAIRING) {
                                             if (activePath == ConnectionWorkflow.SHOW && ui.home.intent == PairingIntent.CREATE) {
-                                                WorkflowOwnCode(ui.home.code) { url ->
-                                                    sharingLink = true
-                                                    try { connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
-                                                    }, "Share connection link")) } catch (error: Exception) { sharingLink = false; throw error }
-                                                }
-                                                Text("Scan this QR with the sharing device or enter the code there.")
+                                                WorkflowOwnCode(ui.home.code)
                                             }
                                             if (activePath == ConnectionWorkflow.CONNECT) {
                                                 Button(enabled = !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
-                                                Text("OR", style = MaterialTheme.typography.labelMedium)
                                                 OutlinedTextField(code, { value ->
                                                     val normalized = AutoPairing.input(value)
                                                     if (normalized != null) { code = normalized; error = "" }
@@ -151,7 +147,7 @@ class ReceiverActivity : ComponentActivity() {
                                                 Button(enabled = !scanning, modifier = Modifier.fillMaxWidth(), onClick = { if (!model.join(code)) error = "Invalid connection code" }) { Text("Connect") }
                                             }
                                         }
-                                        Text(ConnectionWorkflow.displayStatus(ui.home.status))
+                                        if (phase == ReceiverPhase.CONNECTING) Text(ConnectionWorkflow.displayStatus(ui.home.status))
                                         if (error.isNotEmpty()) Text(error)
                                         if (phase == ReceiverPhase.ERROR || phase == ReceiverPhase.ENDED) {
                                             Button(onClick = { code = ""; error = ""; model.retry() }) { Text("Retry receiving") }
@@ -161,11 +157,13 @@ class ReceiverActivity : ComponentActivity() {
                                 }
                             }
                         }
+                        if (activePath == null) {
                         TextButton(onClick = { diagnostics = !diagnostics }) { Text("Advanced diagnostics") }
                         if (diagnostics) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(12.dp)) {
                             Text("Media role: "+mediaMode.role.name)
                             Text("Current received video: ${ui.resolution}")
                             Text(ui.metrics)
+                        }
                         }
                     }
                 }

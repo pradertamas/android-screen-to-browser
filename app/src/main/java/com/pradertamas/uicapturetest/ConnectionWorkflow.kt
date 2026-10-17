@@ -1,9 +1,5 @@
 package com.pradertamas.uicapturetest
 
-import android.content.ClipData
-import android.content.ClipDescription
-import android.content.ClipboardManager
-import android.os.PersistableBundle
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -11,7 +7,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 
@@ -63,23 +58,10 @@ fun WorkflowPanel(path: String, backEnabled: Boolean, back: () -> Unit, content:
 }
 
 @Composable
-fun WorkflowOwnCode(code: String, shareLink: (String) -> Unit) {
+fun WorkflowOwnCode(code: String) {
     if (PairingCode.normalize(code) != code) return
-    val context = LocalContext.current
-    var feedback by remember(code) { mutableStateOf("") }
     val qr = remember(code) { runCatching { pairingQr(code).asImageBitmap() }.getOrNull() }
     if (qr != null) Image(qr, "Connection QR code", Modifier.fillMaxWidth().height(220.dp))
     Text("Connection code", style = MaterialTheme.typography.labelLarge)
     SelectionContainer { Text(code, style = MaterialTheme.typography.displayMedium, fontFamily = FontFamily.Monospace) }
-    Button(modifier = Modifier.fillMaxWidth(), onClick = {
-        runCatching {
-            val clip = ClipData.newPlainText("Connection link", PairingCode.receiverUrl(code))
-            clip.description.extras = PersistableBundle().apply { putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true) }
-            context.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
-        }.fold({ feedback = "Connection link copied." }, { feedback = "Link could not be copied." })
-    }) { Text("Copy connection link") }
-    OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = {
-        runCatching { shareLink(PairingCode.receiverUrl(code)) }.onFailure { feedback = "Link could not be shared." }
-    }) { Text("Share connection link") }
-    if (feedback.isNotEmpty()) Text(feedback)
 }

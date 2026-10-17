@@ -41,7 +41,7 @@ class ConnectionWorkflowTest {
             assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)"))
             assertTrue(activity.contains("padding(24.dp)"))
         }
-        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("val activePath")
+        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("}) { selectedPath = it }")
         assertTrue(topShare.contains("PairingHost.remoteShareText()"))
         assertTrue(topShare.contains("startActivity(Intent.createChooser"))
         assertFalse(topShare.contains("createScreenCaptureIntent")); assertFalse(topShare.contains("controller.join"))
@@ -57,6 +57,24 @@ class ConnectionWorkflowTest {
         assertTrue(selector.contains("selected = role == value"))
         assertTrue(selector.contains("heightIn(min = 56.dp)"))
         assertTrue(text("PairingInviteActivity.kt").contains("AppPairingSection"))
+    }
+    @Test fun taskViewsHideHomeAndStartAtTopWithoutShareActions() {
+        for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
+            val activity = text(name)
+            val home = activity.substringAfter("if (activePath == null) {").substringBefore("if (activePath != null) WorkflowPanel")
+            assertTrue(home.contains("1. Choose role")); assertTrue(home.contains("WorkflowStart("))
+            val task = activity.substringAfter("if (activePath != null) WorkflowPanel").substringBefore("if (activePath == null) {")
+            assertFalse(task.contains("Share connection link")); assertFalse(task.contains("Copy connection link"))
+            assertTrue(task.contains("WorkflowOwnCode(")); assertTrue(task.contains("Scan QR code"))
+            assertTrue(task.contains("Connection code")); assertTrue(task.contains("Text(\"Connect\")"))
+            assertTrue(task.indexOf("Scan QR code") < task.indexOf("OutlinedTextField"))
+            assertTrue(task.contains("selectedPath = null"))
+            assertTrue(activity.contains("remember(activePath) { androidx.compose.foundation.ScrollState(0) }"))
+            assertTrue(activity.contains("verticalScroll(taskScroll)"))
+        }
+        assertTrue(text("ConnectionWorkflow.kt").contains("Text(\"Back\")"))
+        assertTrue(text("MainActivity.kt").contains("scanning = false; externalUi = false"))
+        assertTrue(text("ReceiverActivity.kt").contains("addOnCanceledListener { scanning = false }"))
     }
     @Test fun onlyValidPublicDeviceIdentifiersCanBeDisplayed() {
         val id = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(16) { 7 })
@@ -88,8 +106,10 @@ class ConnectionWorkflowTest {
         val url = PairingCode.receiverUrl("7K4M2Q")
         assertEquals("7K4M2Q", PairingCode.parseQr(url))
         val ui = text("ConnectionWorkflow.kt")
-        assertTrue(ui.contains("PairingCode.receiverUrl(code)")); assertTrue(ui.contains("Copy connection link"))
-        assertTrue(ui.contains("Share connection link")); assertTrue(ui.contains("ClipDescription.EXTRA_IS_SENSITIVE"))
+        val own = ui.substringAfter("fun WorkflowOwnCode")
+        assertTrue(own.contains("pairingQr(code)")); assertTrue(own.contains("Connection code"))
+        assertFalse(own.contains("Copy connection link")); assertFalse(own.contains("Share connection link"))
+        assertFalse(own.contains("Button(")); assertFalse(own.contains("shareLink"))
         assertEquals("Connection code not found", ConnectionWorkflow.displayStatus("Pairing code not found"))
     }
     @Test fun receiverScannerDoesNotAddCaptureOrMediaPermissionPath() {
