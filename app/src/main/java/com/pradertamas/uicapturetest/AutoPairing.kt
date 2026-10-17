@@ -3,7 +3,11 @@ package com.pradertamas.uicapturetest
 enum class PairingPhase { STOPPED, CREATING, WAITING, JOINING, CONSENT, CONNECTING, STREAMING, ERROR }
 data class PairingHome(val phase: PairingPhase = PairingPhase.STOPPED, val code: String = "",
     val intent: PairingIntent = PairingIntent.CREATE, val epoch: Long = 0, val notice: String = "")
-interface PairingLink { fun send(text: String): Boolean; fun close() }
+interface PairingLink {
+    val remotePresenceSupported: Boolean get() = false
+    fun send(text: String): Boolean
+    fun close()
+}
 interface PairingTransport {
     fun open(code: String, intent: PairingIntent, message: (String, String, String) -> Unit, ended: () -> Unit): PairingLink
 }
@@ -12,7 +16,8 @@ interface PairingTransport {
 class AutoPairing(private val transport: PairingTransport,
     private val later: (Long, () -> Unit) -> (() -> Unit),
     private val changed: (PairingHome) -> Unit,
-    private val generate: () -> String = PairingCode::generate) {
+    private val generate: () -> String = PairingCode::generate,
+    private val remoteToken: () -> String? = { null }) {
     companion object {
         const val ROTATE_MS = 300_000L
         const val DEBOUNCE_MS = 250L
@@ -74,6 +79,7 @@ class AutoPairing(private val transport: PairingTransport,
                         "ok" -> {
                             timeout?.invoke(); timeout = null
                             publish(home.copy(phase = PairingPhase.WAITING))
+                            refreshRemotePresence()
                             if (home.intent == PairingIntent.CREATE) rotation = later(ROTATE_MS) {
                                 if (epoch == home.epoch && home.phase == PairingPhase.WAITING) create()
                             }
@@ -100,6 +106,13 @@ class AutoPairing(private val transport: PairingTransport,
     fun claimConsent(): Long? {
         if (home.phase != PairingPhase.CONSENT || consentRequested) return null
         consentRequested = true; return home.epoch
+    }
+    fun refreshRemotePresence() {
+        if (visible && home.phase == PairingPhase.WAITING && home.intent == PairingIntent.CREATE && link?.remotePresenceSupported == true) {
+            val token = runCatching { remoteToken() }.getOrNull()
+            if (token != null && RemoteDevice.valid(token))
+                link?.send("{\"type\":\"remote-presence-register\",\"token\":\"$token\"}")
+        }
     }
     fun allow(epoch: Long): Boolean {
         if (epoch != home.epoch || home.phase != PairingPhase.CONSENT || !consentRequested) return false

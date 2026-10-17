@@ -51,3 +51,7 @@ capture notification after Cancel. The complete A-I matrix is also in the web
 project's AUTO_PAIRING.md in this workspace.
 
 All changes are local. No commit/push/deploy; experiments/poc4b is untouched.
+
+Persistent remote links are an additional optional path; see REMOTE_LINK.md.
+They resolve only waiting own CREATE presence to this same short session/consent
+flow, without changing capture or the local pairing UI.

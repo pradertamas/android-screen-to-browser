@@ -2,6 +2,9 @@ package com.pradertamas.uicapturetest
 
 import android.app.Activity
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ClipDescription
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
@@ -44,6 +47,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        PairingHost.initialize(this)
         consentEpoch = savedInstanceState?.getLong("consentEpoch", -1L) ?: -1L
         externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
         enableEdgeToEdge()
@@ -55,6 +59,8 @@ class MainActivity : ComponentActivity() {
             val home by PairingHost.state.collectAsState()
             val lifecycleState by lifecycle.currentStateFlow.collectAsState()
             var joinCode by rememberSaveable { mutableStateOf("") }
+            var regenerateRemote by remember { mutableStateOf(false) }
+            var remoteFeedback by remember { mutableStateOf("Remote link ready") }
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 externalUi = false
                 val data = result.data
@@ -178,6 +184,42 @@ class MainActivity : ComponentActivity() {
                         if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
                             startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
                         }) { Text("Stop") }
+                        HorizontalDivider()
+                        Text("Remote connection", style = MaterialTheme.typography.titleMedium)
+                        Text("Use this link when the receiving device is far away.")
+                        Text(remoteFeedback)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = {
+                                try {
+                                    val share = Intent(Intent.ACTION_SEND).apply {
+                                        type = RemoteDevice.MIME_TYPE
+                                        putExtra(Intent.EXTRA_SUBJECT, RemoteDevice.SUBJECT)
+                                        putExtra(Intent.EXTRA_TEXT, PairingHost.remoteShareText())
+                                    }
+                                    startActivity(Intent.createChooser(share, "Share link"))
+                                } catch (_: Exception) { remoteFeedback = "Link could not be shared. Please try again." }
+                            }) { Text("Share link") }
+                            Button(onClick = {
+                                try {
+                                    val clip = ClipData.newPlainText("Screen sharing link", PairingHost.remoteLink())
+                                    clip.description.extras = android.os.PersistableBundle().apply { putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true) }
+                                    getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
+                                    remoteFeedback = "Link copied"
+                                } catch (_: Exception) { remoteFeedback = "Link could not be copied. Please try again." }
+                            }) { Text("Copy link") }
+                        }
+                        TextButton(onClick = { regenerateRemote = true }) { Text("Regenerate link") }
+                        Text("Anyone with this link can request a connection while this phone is waiting. Screen sharing still requires approval on the phone.")
+                        if(regenerateRemote) AlertDialog(
+                            onDismissRequest = { regenerateRemote = false },
+                            title = { Text("Regenerate remote link?") },
+                            text = { Text("Existing shared links will stop working.") },
+                            confirmButton = { TextButton(onClick = {
+                                regenerateRemote = false
+                                try { PairingHost.regenerateRemoteLink(); remoteFeedback = "New remote link saved" }
+                                catch (_: Exception) { remoteFeedback = "Link could not be replaced. Please try again." }
+                            }) { Text("Regenerate") } },
+                            dismissButton = { TextButton(onClick = { regenerateRemote = false }) { Text("Cancel") } })
                         TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
                         if (diagnostics) {
                         Text("WebRTC diagnostics", style = MaterialTheme.typography.titleMedium)
