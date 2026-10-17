@@ -8,11 +8,10 @@ import android.os.*
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import okhttp3.*
 import org.json.JSONObject
 import org.webrtc.*
 import java.util.Locale
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 object WebRtcConfig {
     const val RELAY = "wss://realtime-relay-k28l.onrender.com/ws"
@@ -23,8 +22,8 @@ object WebRtcState {
     private val mutable = MutableStateFlow(WebRtcUi())
     val state = mutable.asStateFlow()
     fun set(value: WebRtcUi) { mutable.value = value }
-    // Consent precedes service/capture/signaling startup. Reset only the pending UI;
-    // never start a service just to stop a session that has not registered yet.
+    // Capture starts only after consent. PairingHost separately retires the
+    // pre-consent signaling registration; cancellation never starts a service.
     fun cancelConsent() { set(WebRtcUi(status = "Sharing cancelled")) }
 }
 
@@ -36,6 +35,7 @@ class WebRtcService : Service() {
         const val CONSENT = "consent"
         const val SESSION = "session"
         const val INTENT = "pairingIntent"
+        const val EPOCH = "pairingEpoch"
     }
     private val thread = HandlerThread("WebRtcControl")
     private lateinit var handler: Handler
@@ -50,7 +50,7 @@ class WebRtcService : Service() {
     private var source: VideoSource? = null
     private var track: VideoTrack? = null
     private var peer: PeerConnection? = null
-    private var socket: WebSocket? = null
+    private var pairingEpoch = -1L
     private var registration: PairingRegistration? = null
     private var pairingIntent = PairingIntent.CREATE
     private var registered = false
@@ -58,8 +58,6 @@ class WebRtcService : Service() {
     private var addressFamily = "N/A"
     private var bytesAvailable = false
     private val directTimeout = Runnable { finish("Direct connection could not be established.") }
-    private val waitingTimeout = Runnable { finish("Pairing code expired. Start a new share.") }
-    private val http = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
     private val pendingIce = mutableListOf<IceCandidate>()
     private var offered = false
     private var remoteSet = false
@@ -78,6 +76,10 @@ class WebRtcService : Service() {
     private var rttMax = 0.0
     private var rttCount = 0
     private var statsPending = false
+    private var captureResize: CaptureResizeController? = null
+    private var finalContent: CaptureSize? = null
+    private var finalOutput: CaptureSize? = null
+    private val projectionEnded = AtomicBoolean(false)
     private val ticker = object : Runnable {
         override fun run() {
             if (closing) return
@@ -93,8 +95,10 @@ class WebRtcService : Service() {
         started = true
         val consent = intent.getParcelableExtra(CONSENT, Intent::class.java)
         val session = intent.getStringExtra(SESSION).orEmpty()
+        pairingEpoch = intent.getLongExtra(EPOCH, -1L)
         try {
             pairingIntent = PairingIntent.valueOf(intent.getStringExtra(INTENT) ?: "CREATE")
+            check(pairingEpoch == PairingHost.state.value.epoch && PairingHost.state.value.phase == PairingPhase.CONNECTING)
             check(consent != null && PairingCode.normalize(session) == session) { "Invalid consent/session" }
             check(!CaptureState.state.value.busy) { "Stop PoC 3B first" }
             getSystemService(NotificationManager::class.java).createNotificationChannel(
@@ -119,52 +123,58 @@ class WebRtcService : Service() {
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl!!.eglBaseContext)).createPeerConnectionFactory()
         source = factory!!.createVideoSource(true)
         // ScreenCapturerAndroid ignores FPS; adaptOutputFormat and sender encoding enforce the requested cap.
-        source!!.adaptOutputFormat(720, 1560, 30)
+        source!!.adaptOutputFormat(CaptureDimensions.INITIAL.width,
+            CaptureDimensions.INITIAL.height, CaptureDimensions.FPS)
         helper = SurfaceTextureHelper.create("WebRtcScreen", egl!!.eglBaseContext)
+        captureResize = CaptureResizeController({ delay, action ->
+            val task = Runnable { action() }; handler.postDelayed(task, delay)
+            val cancel: () -> Unit = { handler.removeCallbacks(task) }; cancel
+        }, { size ->
+            if (!closing && !disposed && !projectionEnded.get()) {
+                try {
+                    // Keep adaptation in sync too: retaining the initial 19.5:9
+                    // aspect request would crop other captured-app shapes.
+                    source?.adaptOutputFormat(size.width, size.height, CaptureDimensions.FPS)
+                    capturer?.changeCaptureFormat(size.width, size.height, CaptureDimensions.FPS)
+                }
+                catch (_: Exception) { finish("Capture resize failed") }
+            } else captureResize?.stop()
+        }).also { it.start() }
         capturer = ScreenCapturerAndroid(consent, object : MediaProjection.Callback() {
-            override fun onStop() { handler.post { finish("Projection stopped by system") } }
+            override fun onStop() {
+                projectionEnded.set(true)
+                handler.post { finish("Projection stopped by system") }
+            }
+            // libwebrtc registers this callback on its SurfaceTextureHelper thread.
+            // Never resize inline here: changeCaptureFormat synchronously marshals to
+            // that thread. Serialize with capture startup/disposal on WebRtcControl.
+            override fun onCapturedContentResize(width: Int, height: Int) { handler.post {
+                if (!closing && !disposed && !projectionEnded.get()) captureResize?.resized(width, height)
+            } }
         })
         capturer!!.initialize(helper, applicationContext, source!!.capturerObserver)
-        capturer!!.startCapture(720, 1560, 30)
+        capturer!!.startCapture(CaptureDimensions.INITIAL.width,
+            CaptureDimensions.INITIAL.height, CaptureDimensions.FPS)
         track = factory!!.createVideoTrack("screen", source)
         registration = PairingRegistration(session, pairingIntent)
-        connectSender()
-        handler.postDelayed(waitingTimeout, 5 * 60_000L)
+        PairingHost.post { host ->
+            val attached = host.attach(pairingEpoch, { text -> handler.post {
+                if (!closing) try { receive(JSONObject(text)) } catch (_: Exception) { finish("Connection failed") }
+            } }, { handler.post { finish("Disconnected") } })
+            handler.post {
+                if (!attached) finish("Pairing expired")
+                else if (!closing) {
+                    registered = true
+                    receive(JSONObject().put("type", "peer-present"))
+                }
+            }
+        }
         handler.post(ticker)
     }
     private fun setStatus(status: String) {
         userStatus = status
         WebRtcState.set(WebRtcState.state.value.copy(busy = true, status = status,
             pairingCode = registration?.code.orEmpty()))
-    }
-    private fun connectSender() {
-        if (closing) return
-        registered = false
-        val pairing = checkNotNull(registration)
-        setStatus("Connecting")
-        socket = http.newWebSocket(Request.Builder().url("${WebRtcConfig.RELAY}?session=${pairing.code}&role=sender&intent=${pairing.intent.wire}").build(), object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) { handler.post {
-                if (!closing && webSocket === socket) {
-                    setStatus("Connecting")
-                }
-            } }
-            override fun onMessage(webSocket: WebSocket, text: String) { handler.post {
-                if (!closing && webSocket === socket) try { receive(JSONObject(text)) }
-                catch (_: Exception) { finish("Connection could not be established. Start a new share.") }
-            } }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val code = response?.code
-                response?.close()
-                handler.post {
-                    if (closing || webSocket !== socket) return@post
-                    if (pairing.retry(code) != null) connectSender()
-                    else finish(if (code == 409) "Could not reserve a pairing code. Please start again." else "Disconnected. Check your internet connection and start again.")
-                }
-            }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { handler.post {
-                if (webSocket === socket) finish("Disconnected")
-            } }
-        })
     }
     private fun createPeerAndOffer() {
         val config = PeerConnection.RTCConfiguration(listOf(PeerConnection.IceServer.builder(WebRtcConfig.STUN).createIceServer())).apply {
@@ -178,7 +188,7 @@ class WebRtcService : Service() {
                 handler.post {
                     if (closing) return@post
                     when (s) {
-                        PeerConnection.PeerConnectionState.CONNECTED -> { handler.removeCallbacks(directTimeout); setStatus("Streaming") }
+                        PeerConnection.PeerConnectionState.CONNECTED -> { handler.removeCallbacks(directTimeout); setStatus("Streaming"); PairingHost.post { it.streaming(pairingEpoch) } }
                         PeerConnection.PeerConnectionState.DISCONNECTED -> { setStatus("Disconnected"); handler.postDelayed(directTimeout, 15_000) }
                         PeerConnection.PeerConnectionState.FAILED -> finish("Direct connection could not be established.")
                         else -> Unit
@@ -211,7 +221,9 @@ class WebRtcService : Service() {
         if (text.toByteArray(Charsets.UTF_8).size >= 64 * 1024) {
             handler.post { finish("Signaling payload too large") }; return
         }
-        if (socket?.send(text) != true) handler.post { finish("Signaling unavailable") }
+        PairingHost.post { host ->
+            if (!host.send(pairingEpoch, text)) handler.post { finish("Signaling unavailable") }
+        }
     }
     private fun observer(done: (SessionDescription?) -> Unit = {}) = object : SdpObserver {
         override fun onCreateSuccess(s: SessionDescription) { handler.post { if (!closing) try { done(s) } catch (e: Exception) { finish("SDP error: ${e.message}") } } }
@@ -221,20 +233,9 @@ class WebRtcService : Service() {
     }
     private fun receive(m: JSONObject) {
         when (m.getString("type")) {
-            "registration" -> when (m.getString("status")) {
-                "ok" -> { registered = true; setStatus(if (pairingIntent == PairingIntent.CREATE) "Waiting for receiving screen..." else "Browser connected") }
-                "conflict" -> {
-                    val old = socket
-                    if (registration?.retry(409) != null) { socket = null; old?.close(1000, "Retry"); connectSender() }
-                    else finish("Pairing code already in use. Please create another pairing.")
-                }
-                "not-found" -> finish("Pairing code not found or expired.")
-                else -> finish("Pairing code already in use.")
-            }
             "peer-present" -> if (!offered) {
                 check(registered)
                 offered = true
-                handler.removeCallbacks(waitingTimeout)
                 setStatus("Browser connected")
                 handler.postDelayed(directTimeout, 45_000)
                 createPeerAndOffer()
@@ -310,14 +311,18 @@ class WebRtcService : Service() {
             "Duration: ${fmt(seconds)} s\nBytes sent: ${if (bytesAvailable) fmt(bytes) else "N/A"}\nAverage bitrate: ${fmt(bytes * 8 / seconds)} bps\n" +
             "Current bitrate: ${fmt(currentBitrate)} bps\n" +
             "Peak bitrate (~1 s): ${fmt(peak)} bps\nFrames sent: ${fmt(frames)}\nAverage FPS: ${fmt(frames / seconds)}\n" +
-            "Codec: $codec\nEncoded resolution: $resolution\nCapture profile: 720 × 1560 / 30 FPS / max 2 Mbps\n" +
+            "Codec: $codec\nEncoded resolution: $resolution\n" +
+            "Captured content: ${captureResize?.content ?: finalContent ?: "N/A"}\nCapture output: ${captureResize?.output ?: finalOutput ?: "N/A"}\n" +
+            "Capture bounds: 720 × 1560 portrait / 1560 × 720 landscape / 30 FPS / max 2 Mbps\n" +
             "Candidate local / remote: $candidate\nProtocol: $protocol\nAverage RTT: ${if (rttCount > 0) fmt(rttTotal / rttCount) else "N/A"} ms\nMaximum RTT: ${if (rttCount > 0) fmt(rttMax) else "N/A"} ms"
     }
     private fun finish(reason: String) {
         if (closing) return
         runCatching { send(JSONObject().put("type", "bye")) }
         closing = true; handler.removeCallbacks(ticker)
-        handler.removeCallbacks(directTimeout); handler.removeCallbacks(waitingTimeout)
+        finalContent = captureResize?.content; finalOutput = captureResize?.output
+        captureResize?.stop()
+        handler.removeCallbacks(directTimeout)
         // Take a final counter snapshot before disposing. Bound the wait if native stats do not return.
         val pc = peer
         if (pc == null) { completeFinish(reason); return }
@@ -333,7 +338,6 @@ class WebRtcService : Service() {
         if (disposed) return
         disposed = true
         val snapshot = if (startedAt > 0) summary(SystemClock.elapsedRealtime()) else WebRtcState.state.value.metrics
-        socket?.close(1000, "Session stopped"); socket = null
         peer?.close(); peer?.dispose(); peer = null
         runCatching { capturer?.stopCapture() }.onFailure { Log.w("WebRtcPoC", "Capture stop", it) }
         capturer?.dispose(); capturer = null
@@ -343,13 +347,13 @@ class WebRtcService : Service() {
         factory?.dispose(); factory = null
         egl?.release(); egl = null
         pendingIce.clear()
-        http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
         WebRtcState.set(WebRtcUi(true, reason, snapshot))
         stopForeground(STOP_FOREGROUND_REMOVE)
         if (destroyed) releaseControlThread() else stopSelf()
     }
     private fun releaseControlThread() {
         WebRtcState.set(WebRtcState.state.value.copy(busy = false))
+        PairingHost.post { it.mediaStopped(pairingEpoch) }
         thread.quitSafely()
     }
     override fun onDestroy() {

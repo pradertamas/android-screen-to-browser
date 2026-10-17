@@ -9,6 +9,9 @@ diagnostics. The QR Bitmap is generated once per code, not per video frame.
 
 ## Normal flow
 
+Current automatic CREATE/Scan/auto-JOIN UX supersedes the manual flow below:
+see [AUTO_PAIRING.md](AUTO_PAIRING.md). The older flow is retained as history.
+
 This document records the earlier Android-created pairing UX. The current
 two-initiator Create/Scan/Enter release, exact protocol, dependencies and four
 physical flows are documented in [SYMMETRIC_PAIRING.md](SYMMETRIC_PAIRING.md).

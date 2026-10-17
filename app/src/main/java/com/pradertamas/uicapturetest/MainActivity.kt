@@ -5,6 +5,8 @@ import android.content.Intent
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import androidx.lifecycle.Lifecycle
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -31,44 +33,68 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
+    private var externalUi = false
+    private var consentEpoch = -1L
+    override fun onStart() { super.onStart(); if (!CaptureState.state.value.busy) PairingHost.controller.show() }
+    override fun onStop() { if (!externalUi) PairingHost.controller.hide(); super.onStop() }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putLong("consentEpoch", consentEpoch)
+        outState.putBoolean("externalUi", externalUi)
+        super.onSaveInstanceState(outState)
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        consentEpoch = savedInstanceState?.getLong("consentEpoch", -1L) ?: -1L
+        externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
         enableEdgeToEdge()
         setContent {
             val state by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
             var diagnostics by remember { mutableStateOf(false) }
             var scanning by remember { mutableStateOf(false) }
-            var entering by remember { mutableStateOf(false) }
-            var joinCode by remember { mutableStateOf("") }
+            val home by PairingHost.state.collectAsState()
+            val lifecycleState by lifecycle.currentStateFlow.collectAsState()
+            var joinCode by rememberSaveable { mutableStateOf("") }
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                externalUi = false
                 val data = result.data
-                if (result.resultCode == Activity.RESULT_OK && data != null) {
+                if (result.resultCode == Activity.RESULT_OK && data != null && PairingHost.controller.allow(consentEpoch)) {
                     try {
                         startForegroundService(Intent(this, WebRtcService::class.java).apply {
                             action = WebRtcService.START
                             putExtra(WebRtcService.CONSENT, data)
-                            putExtra(WebRtcService.SESSION, WebRtcState.state.value.pairingCode)
-                            putExtra(WebRtcService.INTENT, WebRtcState.state.value.intent.name)
+                            putExtra(WebRtcService.SESSION, PairingHost.state.value.code)
+                            putExtra(WebRtcService.INTENT, PairingHost.state.value.intent.name)
+                            putExtra(WebRtcService.EPOCH, consentEpoch)
                         })
-                    } catch (e: Exception) { WebRtcState.set(WebRtcUi(status = "Start error: ${e.message}")) }
+                    } catch (_: Exception) { WebRtcState.cancelConsent(); PairingHost.controller.cancel(consentEpoch) }
                 } else {
-                    entering = false
                     scanning = false
                     joinCode = ""
                     WebRtcState.cancelConsent()
+                    PairingHost.controller.cancel(consentEpoch)
                 }
             }
-            val launchMediaProjectionConsent: (String, PairingIntent) -> Unit = { code, intent ->
-                WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing", pairingCode = code, intent = intent))
-                entering = false
-                // Pairing origin affects signaling only. Every sender session requests a fresh
-                // system choice between an application and the entire screen; never retain a token.
-                try {
-                    rtcConsent.launch(getSystemService(MediaProjectionManager::class.java)
-                        .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice()))
+            LaunchedEffect(home.phase, lifecycleState, state.busy) {
+                if (home.phase == PairingPhase.JOINING) joinCode = ""
+                if (state.busy) { PairingHost.controller.hide(); return@LaunchedEffect }
+                if (lifecycleState == Lifecycle.State.RESUMED) {
+                    PairingHost.controller.show()
+                    val epoch = PairingHost.controller.claimConsent()
+                    if (epoch != null) {
+                        consentEpoch = epoch
+                        joinCode = ""
+                        externalUi = true
+                        WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing",
+                            pairingCode = home.code, intent = home.intent))
+                        try {
+                            rtcConsent.launch(getSystemService(MediaProjectionManager::class.java)
+                                .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice()))
+                        } catch (_: Exception) {
+                            externalUi = false; WebRtcState.cancelConsent(); PairingHost.controller.cancel(epoch)
+                        }
+                    }
                 }
-                catch (_: Exception) { WebRtcState.set(WebRtcUi(status = "Screen sharing could not start.")) }
             }
             val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 val data = result.data
@@ -89,33 +115,41 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
-                        if (rtc.pairingCode.isNotEmpty()) {
-                            Text("Pairing code", style = MaterialTheme.typography.titleMedium)
+                        if (home.code.isNotEmpty() && home.intent == PairingIntent.CREATE) {
+                            Text("Pair with this phone", style = MaterialTheme.typography.titleMedium)
                             SelectionContainer {
-                                Text(rtc.pairingCode, style = MaterialTheme.typography.displayLarge, fontFamily = FontFamily.Monospace)
+                                Text(home.code, style = MaterialTheme.typography.displayLarge, fontFamily = FontFamily.Monospace)
                             }
-                            val qr = remember(rtc.pairingCode) { runCatching { pairingQr(rtc.pairingCode).asImageBitmap() }.getOrNull() }
+                            val qr = remember(home.code) { runCatching { pairingQr(home.code).asImageBitmap() }.getOrNull() }
                             if (qr != null) Image(qr, contentDescription = "Scan to open Screen Receiver with this pairing code", modifier = Modifier.size(220.dp))
                             else Text("QR unavailable. Enter the pairing code on the receiver.")
-                            Text(if (rtc.intent == PairingIntent.CREATE) "Enter this code in Screen Receiver, or scan the QR." else "Joining the receiving screen.")
-                        } else Text("Start a share to get a new pairing code.")
-                        Text(rtc.status, style = MaterialTheme.typography.titleMedium)
-                        if (!rtc.busy) {
-                            Button(enabled = !state.busy && !scanning, onClick = { launchMediaProjectionConsent(PairingCode.generate(), PairingIntent.CREATE) }) { Text("Create pairing") }
-                            Text("Join a pairing", style = MaterialTheme.typography.titleMedium)
+                            Text("Scan this QR from the receiving device or enter the code there.")
+                        }
+                        Text(if (home.phase == PairingPhase.STREAMING) "Sharing your screen" else when (home.phase) {
+                            PairingPhase.CREATING, PairingPhase.WAITING -> "Waiting for another device..."
+                            PairingPhase.CONSENT -> "Allow screen sharing"
+                            PairingPhase.STOPPED, PairingPhase.ERROR -> "Getting ready..."
+                            else -> "Connecting..."
+                        }, style = MaterialTheme.typography.titleMedium)
+                        if (home.notice.isNotEmpty()) Text(home.notice)
+                        if (PairingHost.controller.editable() && !rtc.busy) {
+                            Text("Join another device", style = MaterialTheme.typography.titleMedium)
                             Button(enabled = !state.busy && !scanning, onClick = {
+                                PairingHost.controller.typed("")
                                 scanning = true
+                                externalUi = true
                                 val options = GmsBarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
                                 try { GmsBarcodeScanning.getClient(this@MainActivity, options).startScan()
                                     // Activity-scoped Task listeners are removed onStop when the scanner UI opens.
                                     .addOnSuccessListener { barcode ->
                                         if (isDestroyed || isFinishing) return@addOnSuccessListener
                                         scanning = false
+                                        externalUi = false
                                         val code = PairingCode.parseQr(barcode.rawValue.orEmpty())
-                                        if (code != null) launchMediaProjectionConsent(code, PairingIntent.JOIN)
-                                        else WebRtcState.set(WebRtcUi(status = "QR code is not a valid pairing code."))
+                                        if (code != null) PairingHost.controller.join(code)
+                                        else PairingHost.controller.notice("QR code is not a valid pairing code.")
                                     }
-                                    .addOnCanceledListener { if (!isDestroyed && !isFinishing) { scanning = false; WebRtcState.set(WebRtcUi(status = "Scan cancelled")) } }
+                                    .addOnCanceledListener { if (!isDestroyed && !isFinishing) { scanning = false; externalUi = false; PairingHost.controller.notice("Scan cancelled") } }
                                     .addOnFailureListener { error ->
                                         if (!isDestroyed && !isFinishing) {
                                             scanning = false
@@ -124,20 +158,22 @@ class MainActivity : ComponentActivity() {
                                                 MlKitException.CODE_SCANNER_CANCELLED -> "Scan cancelled"
                                                 else -> "Camera is not available. Enter the pairing code instead."
                                             }
-                                            WebRtcState.set(WebRtcUi(status = message))
+                                            externalUi = false; PairingHost.controller.notice(message)
                                         }
                                     }
-                                } catch (_: Exception) { scanning = false; WebRtcState.set(WebRtcUi(status = "Camera is not available. Enter the pairing code instead.")) }
+                                } catch (_: Exception) { scanning = false; externalUi = false; PairingHost.controller.notice("Camera is not available. Enter the pairing code instead.") }
                             }) { Text(if (scanning) "Scanning..." else "Scan QR code") }
-                            TextButton(enabled = !state.busy && !scanning, onClick = { entering = !entering }) { Text("Enter pairing code") }
-                            if (entering) {
-                                OutlinedTextField(value = joinCode, onValueChange = { joinCode = it }, label = { Text("Pairing code") }, singleLine = true)
-                                Button(enabled = !state.busy && !scanning, onClick = {
-                                    val code = PairingCode.normalize(joinCode)
-                                    if (code != null) launchMediaProjectionConsent(code, PairingIntent.JOIN)
-                                    else WebRtcState.set(WebRtcUi(status = "Invalid pairing code"))
-                                }) { Text("Continue") }
-                            }
+                            OutlinedTextField(value = joinCode, onValueChange = { value ->
+                                val normalized = AutoPairing.input(value)
+                                if (normalized != null) {
+                                    joinCode = normalized
+                                    PairingHost.controller.typed(normalized)
+                                } else {
+                                    PairingHost.controller.typed("")
+                                    PairingHost.controller.notice("Invalid pairing code")
+                                }
+                            }, enabled = !scanning, label = { Text("Pairing code") }, singleLine = true)
+
                         }
                         if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
                             startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
