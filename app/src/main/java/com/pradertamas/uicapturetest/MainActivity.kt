@@ -38,7 +38,15 @@ import com.google.mlkit.common.MlKitException
 class MainActivity : ComponentActivity() {
     private var externalUi = false
     private var consentEpoch = -1L
-    override fun onStart() { super.onStart(); if (!CaptureState.state.value.busy) PairingHost.controller.show() }
+    private fun openReceiver() {
+        try { startActivity(Intent(this, ReceiverActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
+        catch (_: Exception) { AppMediaRoles.receiverStartFailed() }
+    }
+    override fun onStart() {
+        super.onStart()
+        if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()
+        else if (!CaptureState.state.value.busy) PairingHost.controller.show()
+    }
     override fun onStop() { if (!externalUi) PairingHost.controller.hide(); super.onStop() }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putLong("consentEpoch", consentEpoch)
@@ -54,6 +62,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             val state by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
+            val mediaMode by AppMediaRoles.state.collectAsState()
             var diagnostics by remember { mutableStateOf(false) }
             var scanning by remember { mutableStateOf(false) }
             val home by PairingHost.state.collectAsState()
@@ -64,7 +73,7 @@ class MainActivity : ComponentActivity() {
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 externalUi = false
                 val data = result.data
-                if (result.resultCode == Activity.RESULT_OK && data != null && PairingHost.controller.allow(consentEpoch)) {
+                if (AppMediaRoles.role == MediaRole.SEND && result.resultCode == Activity.RESULT_OK && data != null && PairingHost.controller.allow(consentEpoch)) {
                     try {
                         startForegroundService(Intent(this, WebRtcService::class.java).apply {
                             action = WebRtcService.START
@@ -81,10 +90,10 @@ class MainActivity : ComponentActivity() {
                     PairingHost.controller.cancel(consentEpoch)
                 }
             }
-            LaunchedEffect(home.phase, lifecycleState, state.busy) {
+            LaunchedEffect(home.phase, lifecycleState, state.busy, mediaMode.role) {
                 if (home.phase == PairingPhase.JOINING) joinCode = ""
                 if (state.busy) { PairingHost.controller.hide(); return@LaunchedEffect }
-                if (lifecycleState == Lifecycle.State.RESUMED) {
+                if (lifecycleState == Lifecycle.State.RESUMED && mediaMode.role == MediaRole.SEND) {
                     PairingHost.controller.show()
                     val epoch = PairingHost.controller.claimConsent()
                     if (epoch != null) {
@@ -104,7 +113,7 @@ class MainActivity : ComponentActivity() {
             }
             val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 val data = result.data
-                if (result.resultCode == Activity.RESULT_OK && data != null) {
+                if (AppMediaRoles.role == MediaRole.SEND && result.resultCode == Activity.RESULT_OK && data != null) {
                     CaptureState.set(CaptureUi(status = "Starting", busy = true))
                     try {
                         startForegroundService(Intent(this, CaptureService::class.java).apply {
@@ -121,6 +130,11 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
+                        MediaRoleSelector(mediaMode.role,
+                            MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning) { requested ->
+                            if (AppMediaRoles.switchRole(requested) && requested == MediaRole.RECEIVE) openReceiver()
+                        }
+                        if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         if (home.code.isNotEmpty() && home.intent == PairingIntent.CREATE) {
                             Text("Pair with this phone", style = MaterialTheme.typography.titleMedium)
                             SelectionContainer {
@@ -222,6 +236,7 @@ class MainActivity : ComponentActivity() {
                             dismissButton = { TextButton(onClick = { regenerateRemote = false }) { Text("Cancel") } })
                         TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
                         if (diagnostics) {
+                        Text("Media role: "+mediaMode.role.name)
                         Text("WebRTC diagnostics", style = MaterialTheme.typography.titleMedium)
                         Text(rtc.metrics)
                         Text("Direct P2P / STUN only. 720 x 1560, target 30 FPS, max ~2 Mbps, video only.")
@@ -231,7 +246,7 @@ class MainActivity : ComponentActivity() {
                         Text("Frames received: ${state.frames}")
                         Text("Last frame: ${state.size}")
                         Text("Shared content visible: ${state.visibility}")
-                        Button(enabled = !state.busy && !rtc.busy && !scanning, onClick = {
+                        Button(enabled = mediaMode.role == MediaRole.SEND && !state.busy && !rtc.busy && !scanning, onClick = {
                             CaptureState.set(CaptureUi(status = "Waiting for permission", busy = true))
                             try {
                                 consent.launch(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent())

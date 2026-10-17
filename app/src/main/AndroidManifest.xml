@@ -23,6 +23,7 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <service android:name=".WebRtcService" android:exported="false" android:foregroundServiceType="mediaProjection" />
+        <activity android:name=".ReceiverActivity" android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

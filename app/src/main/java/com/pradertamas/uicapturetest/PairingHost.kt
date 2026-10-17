@@ -25,12 +25,13 @@ object PairingHost {
     fun remoteLink() = RemoteDevice.url(checkNotNull(tokens).get())
     fun remoteShareText() = RemoteDevice.shareText(checkNotNull(tokens).get())
     fun regenerateRemoteLink() { checkNotNull(tokens).regenerate(); controller.refreshRemotePresence() }
+    val mediaRole = MediaRole.SEND
     val controller = AutoPairing(object : PairingTransport {
         override fun open(code: String, intent: PairingIntent, message: (String, String, String) -> Unit, ended: () -> Unit): PairingLink {
             var registrationSeen = false
             var remoteSupported = false
             val ws = http.newWebSocket(Request.Builder()
-                .url("${WebRtcConfig.RELAY}?session=$code&role=sender&intent=${intent.wire}").build(), object : WebSocketListener() {
+                .url(mediaRole.registrationUrl(code, intent)).build(), object : WebSocketListener() {
                 override fun onMessage(webSocket: WebSocket, text: String) { main.post {
                     try {
                         require(text.toByteArray(Charsets.UTF_8).size < 64 * 1024)

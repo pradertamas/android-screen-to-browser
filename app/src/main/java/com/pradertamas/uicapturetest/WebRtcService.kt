@@ -97,6 +97,7 @@ class WebRtcService : Service() {
         val session = intent.getStringExtra(SESSION).orEmpty()
         pairingEpoch = intent.getLongExtra(EPOCH, -1L)
         try {
+            check(AppMediaRoles.role == MediaRole.SEND && MediaRole.SEND.captureAllowed)
             pairingIntent = PairingIntent.valueOf(intent.getStringExtra(INTENT) ?: "CREATE")
             check(pairingEpoch == PairingHost.state.value.epoch && PairingHost.state.value.phase == PairingPhase.CONNECTING)
             check(consent != null && PairingCode.normalize(session) == session) { "Invalid consent/session" }
@@ -177,6 +178,7 @@ class WebRtcService : Service() {
             pairingCode = registration?.code.orEmpty()))
     }
     private fun createPeerAndOffer() {
+        check(MediaRole.SEND.offerer)
         val config = PeerConnection.RTCConfiguration(listOf(PeerConnection.IceServer.builder(WebRtcConfig.STUN).createIceServer())).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             iceTransportsType = PeerConnection.IceTransportsType.ALL
