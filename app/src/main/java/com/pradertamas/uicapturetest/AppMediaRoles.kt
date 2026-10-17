@@ -8,6 +8,9 @@ import kotlinx.coroutines.flow.asStateFlow
 object AppMediaRoles {
     private val mutable = MutableStateFlow(MediaRoleState())
     val state = mutable.asStateFlow()
+    private val receiverRevisionMutable = MutableStateFlow(0L)
+    val receiverRevision = receiverRevisionMutable.asStateFlow()
+    fun receiverPhaseChanged() { receiverRevisionMutable.value++ }
     val role: MediaRole get() = state.value.role
     private data class ReceiverOwner(val identity: Any, val stop: () -> Unit, val canLeave: () -> Boolean)
     private var receiver: ReceiverOwner? = null
@@ -32,6 +35,10 @@ object AppMediaRoles {
     fun switchRole(requested: MediaRole, stopActive: Boolean = false): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
         return controller.switchRole(requested, stopActive)
+    }
+    fun pairingAllowed(): Boolean = when (role) {
+        MediaRole.SEND -> MediaRolePolicy.senderSwitchAllowed(PairingHost.state.value.phase, CaptureState.state.value.busy, WebRtcState.state.value.busy)
+        MediaRole.RECEIVE -> receiver?.canLeave?.invoke() ?: true
     }
     fun receiverStartFailed() {
         switchRole(MediaRole.SEND, stopActive = true)

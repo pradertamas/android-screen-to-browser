@@ -31,7 +31,7 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     }, { delay, action ->
         val task = Runnable { action() }; main.postDelayed(task, delay)
         val cancel: () -> Unit = { main.removeCallbacks(task) }; cancel
-    }, { home -> mutable.value = if (home.phase == ReceiverPhase.PAIRING) ReceiverUi(home) else mutable.value.copy(home = home) })
+    }, { home -> mutable.value = if (home.phase == ReceiverPhase.PAIRING) ReceiverUi(home) else mutable.value.copy(home = home); AppMediaRoles.receiverPhaseChanged() })
     init {
         AppMediaRoles.bindReceiver(this, ::stop, { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) })
         engine.create()

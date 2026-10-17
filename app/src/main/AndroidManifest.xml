@@ -10,6 +10,7 @@
 
     <application
         android:allowBackup="true"
+        android:usesCleartextTraffic="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -23,6 +24,14 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <service android:name=".WebRtcService" android:exported="false" android:foregroundServiceType="mediaProjection" />
+        <activity android:name=".PairingInviteActivity" android:exported="true" android:launchMode="singleTop" android:theme="@style/Theme.PairingInvite">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${pairingAppLinkHost}" android:path="${pairingAppLinkPath}" />
+            </intent-filter>
+        </activity>
         <activity android:name=".ReceiverActivity" android:exported="false" />
         <activity
             android:name=".MainActivity"

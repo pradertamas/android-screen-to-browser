@@ -1,7 +1,20 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
+
+val pairingLocal = Properties().apply {
+    val local = rootProject.file("local.properties")
+    if (local.isFile) local.inputStream().use { load(it) }
+}
+fun pairingSetting(key: String, fallback: String): String = providers.environmentVariable(key).orNull
+    ?: pairingLocal.getProperty(key) ?: fallback
+val pairingApi = pairingSetting("PAIRING_API_BASE_URL", "https://pairing.invalid")
+val pairingHost = pairingSetting("PAIRING_APP_LINK_HOST", "pairing.invalid")
+val pairingPath = pairingSetting("PAIRING_APP_LINK_PATH", "/pair")
+fun quotedConfig(value: String) = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 android {
     namespace = "com.pradertamas.uicapturetest"
@@ -15,6 +28,11 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "PAIRING_API_BASE_URL", quotedConfig(pairingApi))
+        buildConfigField("String", "PAIRING_APP_LINK_HOST", quotedConfig(pairingHost))
+        buildConfigField("String", "PAIRING_APP_LINK_PATH", quotedConfig(pairingPath))
+        manifestPlaceholders["pairingAppLinkHost"] = pairingHost
+        manifestPlaceholders["pairingAppLinkPath"] = pairingPath
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -33,6 +51,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

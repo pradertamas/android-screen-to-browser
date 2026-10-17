@@ -7,6 +7,7 @@
 -->
 <full-backup-content>
     <exclude domain="sharedpref" path="remote_device.xml"/>
+        <exclude domain="sharedpref" path="device_identity.xml"/>
     <!--
    <include domain="sharedpref" path="."/>
    <exclude domain="sharedpref" path="device.xml"/>

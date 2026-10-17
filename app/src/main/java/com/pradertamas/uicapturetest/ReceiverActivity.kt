@@ -45,6 +45,7 @@ class ReceiverActivity : ComponentActivity() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }
         })
+        val appPairing = ViewModelProvider(this)[AppPairingViewModel::class.java]
         setContent {
             val ui by model.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
@@ -69,6 +70,7 @@ class ReceiverActivity : ComponentActivity() {
                                 if (requested == MediaRole.SEND) returnToSend()
                             }
                             if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
+                            if (phase != ReceiverPhase.RECEIVING) AppPairingSection(appPairing, MediaRolePolicy.receiverSwitchAllowed(phase))
                         }
                         Box(Modifier.weight(1f).fillMaxWidth()) {
                             // Keep a surface available behind the opaque pairing/connecting UI so the first frame can render.

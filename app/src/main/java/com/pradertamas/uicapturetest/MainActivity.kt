@@ -8,6 +8,7 @@ import android.content.ClipDescription
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.Lifecycle
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.ComponentActivity
@@ -58,6 +59,7 @@ class MainActivity : ComponentActivity() {
         PairingHost.initialize(this)
         consentEpoch = savedInstanceState?.getLong("consentEpoch", -1L) ?: -1L
         externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
+        val appPairing = ViewModelProvider(this)[AppPairingViewModel::class.java]
         enableEdgeToEdge()
         setContent {
             val state by CaptureState.state.collectAsState()
@@ -135,6 +137,7 @@ class MainActivity : ComponentActivity() {
                             if (AppMediaRoles.switchRole(requested) && requested == MediaRole.RECEIVE) openReceiver()
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
+                        AppPairingSection(appPairing, MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy))
                         if (home.code.isNotEmpty() && home.intent == PairingIntent.CREATE) {
                             Text("Pair with this phone", style = MaterialTheme.typography.titleMedium)
                             SelectionContainer {
