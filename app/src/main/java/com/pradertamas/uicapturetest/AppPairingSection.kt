@@ -4,6 +4,8 @@ import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.Modifier
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
@@ -27,21 +29,19 @@ fun AppPairingSection(model: AppPairingViewModel, allowed: Boolean, compact: Boo
             }
         }
     }
-    var expanded by remember { mutableStateOf(false) }
     Column {
-        if (compact) TextButton(onClick = { expanded = !expanded }) { Text("Manage saved connections") }
-        if (!compact || expanded) {
-        Text("Save a device connection", style = MaterialTheme.typography.titleMedium)
+        if (!compact) {
+            Text("Save a device connection", style = MaterialTheme.typography.titleMedium)
+            Text("Create a temporary link to save a connection with another app installation.")
+        }
         if (!model.config.configured) Text("Connection service is not configured.")
-        Text("Create a temporary link to save a connection with another app installation.")
         val busy = ui.phase in setOf(AppPairingPhase.CREATING_INVITE, AppPairingPhase.INSPECTING_INVITE, AppPairingPhase.ACCEPTING)
-        Button(enabled = model.config.configured && allowed && !busy && ui.phase != AppPairingPhase.AWAITING_CONFIRMATION,
+        Button(modifier = Modifier.fillMaxWidth(), enabled = model.config.configured && allowed && !busy && ui.phase != AppPairingPhase.AWAITING_CONFIRMATION,
             onClick = { model.create(allowed) }) { Text("Share connection link") }
         Text("Connection links expire after 30 minutes and can be used once.")
         if (busy) Text("Please wait...")
         if (ui.message.isNotEmpty()) Text(ConnectionWorkflow.displayStatus(ui.message))
         if (ui.phase == AppPairingPhase.ERROR) Button(enabled = allowed && !busy, onClick = { model.retry(allowed) }) { Text("Retry") }
-        }
         if (ui.phase == AppPairingPhase.AWAITING_CONFIRMATION) AlertDialog(
             onDismissRequest = { model.cancel() },
             title = { Text("Save this device connection?") },

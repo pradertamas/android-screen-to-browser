@@ -19,7 +19,7 @@ MediaProjection user-choice, protocol, identity formats and backup rules unchang
   and the code-link share chooser, like the existing sender external-UI flow.
   Ordinary background navigation still stops the receiver. Streaming is unchanged.
 - Persistent invite creation/inspection/explicit acceptance remains isolated from
-  roles/capture/media. Home has collapsed Manage saved connections; the floating
+  roles/capture/media. Home exposes the same persistent invite share action first in Step 2; the floating
   App Link Activity retains its expanded confirmation surface.
 - There was a GET /v1/pairings client method but no home list, device-name field,
   revoke/remove client action, or persistent-peer-to-media-session bridge.
@@ -28,8 +28,8 @@ MediaProjection user-choice, protocol, identity formats and backup rules unchang
 ## Presentation
 
 1. Choose role: shared segmented buttons with equal touch geometry, real role state.
-2. Choose how to start: real saved-device rows above exactly two primary action
-   cards, then secondary collapsed connection management. Empty list has no fake
+2. Choose how to start: persistent Share connection link first, then real saved-device rows above
+   exactly two connection-path action cards. Empty list has no fake
    rows. Cards share typography, padding and minimum title/helper line geometry.
 3. Selected path only: Connect offers the existing native scanner action, OR,
    alphanumeric connection-code input, Connect and inline status/error. Sender

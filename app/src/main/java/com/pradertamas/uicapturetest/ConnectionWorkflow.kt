@@ -38,8 +38,9 @@ fun WorkflowStart(model: AppPairingViewModel, allowed: Boolean, path: String?, s
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("2. Choose how to start", style = MaterialTheme.typography.titleMedium)
+            AppPairingSection(model, allowed, compact = true)
             if (devices.isNotEmpty()) {
-                Text("Paired devices", style = MaterialTheme.typography.titleSmall)
+                Text("Saved connections", style = MaterialTheme.typography.titleSmall)
                 devices.forEach { device ->
                     // No direct media-session bridge or friendly name exists in this client.
                     OutlinedCard(Modifier.fillMaxWidth()) {
@@ -53,7 +54,6 @@ fun WorkflowStart(model: AppPairingViewModel, allowed: Boolean, path: String?, s
             if (message.isNotEmpty()) Text(message, style = MaterialTheme.typography.bodySmall)
             WorkflowAction("Connect to another device", "Use a QR code or enter a code from another device.", path == ConnectionWorkflow.CONNECT, allowed) { select(ConnectionWorkflow.CONNECT) }
             WorkflowAction("Let another device connect here", "Show a QR code or connection code on this device.", path == ConnectionWorkflow.SHOW, allowed) { select(ConnectionWorkflow.SHOW) }
-            AppPairingSection(model, allowed, compact = true)
         }
     }
 }
