@@ -69,9 +69,11 @@ class MainActivity : ComponentActivity() {
             var scanning by remember { mutableStateOf(false) }
             val home by PairingHost.state.collectAsState()
             val lifecycleState by lifecycle.currentStateFlow.collectAsState()
+            var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var joinCode by rememberSaveable { mutableStateOf("") }
             var regenerateRemote by remember { mutableStateOf(false) }
             var remoteFeedback by remember { mutableStateOf("Remote link ready") }
+            val connectionShare = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { externalUi = false }
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
                 externalUi = false
                 val data = result.data
@@ -132,31 +134,30 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
+                        Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                         MediaRoleSelector(mediaMode.role,
                             MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning) { requested ->
                             if (AppMediaRoles.switchRole(requested) && requested == MediaRole.RECEIVE) openReceiver()
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                        AppPairingSection(appPairing, MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy))
-                        if (home.code.isNotEmpty() && home.intent == PairingIntent.CREATE) {
-                            Text("Pair with this phone", style = MaterialTheme.typography.titleMedium)
-                            SelectionContainer {
-                                Text(home.code, style = MaterialTheme.typography.displayLarge, fontFamily = FontFamily.Monospace)
+                        val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
+                        if (!rtc.busy) WorkflowStart(appPairing, canChoose, selectedPath) { selectedPath = it }
+                        val activePath = selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
+                            if (home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
+                        } else null
+                        if (activePath != null) WorkflowPanel(activePath, canChoose, {
+                            PairingHost.controller.typed(""); joinCode = ""; selectedPath = null
+                        }) {
+                            if (activePath == ConnectionWorkflow.SHOW && home.code.isNotEmpty() && home.intent == PairingIntent.CREATE && !rtc.busy) {
+                                WorkflowOwnCode(home.code) { url ->
+                                    externalUi = true
+                                    try { connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
+                                    }, "Share connection link")) } catch (error: Exception) { externalUi = false; throw error }
+                                }
+                                Text("Scan this QR from the receiving device or enter the code there.")
                             }
-                            val qr = remember(home.code) { runCatching { pairingQr(home.code).asImageBitmap() }.getOrNull() }
-                            if (qr != null) Image(qr, contentDescription = "Scan to open Screen Receiver with this pairing code", modifier = Modifier.size(220.dp))
-                            else Text("QR unavailable. Enter the pairing code on the receiver.")
-                            Text("Scan this QR from the receiving device or enter the code there.")
-                        }
-                        Text(if (home.phase == PairingPhase.STREAMING) "Sharing your screen" else when (home.phase) {
-                            PairingPhase.CREATING, PairingPhase.WAITING -> "Waiting for another device..."
-                            PairingPhase.CONSENT -> "Allow screen sharing"
-                            PairingPhase.STOPPED, PairingPhase.ERROR -> "Getting ready..."
-                            else -> "Connecting..."
-                        }, style = MaterialTheme.typography.titleMedium)
-                        if (home.notice.isNotEmpty()) Text(home.notice)
-                        if (PairingHost.controller.editable() && !rtc.busy) {
-                            Text("Join another device", style = MaterialTheme.typography.titleMedium)
+                            if (activePath == ConnectionWorkflow.CONNECT && PairingHost.controller.editable() && !rtc.busy) {
                             Button(enabled = !state.busy && !scanning, onClick = {
                                 PairingHost.controller.typed("")
                                 scanning = true
@@ -170,22 +171,23 @@ class MainActivity : ComponentActivity() {
                                         externalUi = false
                                         val code = PairingCode.parseQr(barcode.rawValue.orEmpty())
                                         if (code != null) PairingHost.controller.join(code)
-                                        else PairingHost.controller.notice("QR code is not a valid pairing code.")
+                                        else PairingHost.controller.notice("QR code is not a valid connection code.")
                                     }
                                     .addOnCanceledListener { if (!isDestroyed && !isFinishing) { scanning = false; externalUi = false; PairingHost.controller.notice("Scan cancelled") } }
                                     .addOnFailureListener { error ->
                                         if (!isDestroyed && !isFinishing) {
                                             scanning = false
                                             val message = when ((error as? MlKitException)?.errorCode) {
-                                                MlKitException.CODE_SCANNER_CAMERA_PERMISSION_NOT_GRANTED -> "Camera permission denied. Enter the pairing code instead."
+                                                MlKitException.CODE_SCANNER_CAMERA_PERMISSION_NOT_GRANTED -> "Camera permission denied. Enter the connection code instead."
                                                 MlKitException.CODE_SCANNER_CANCELLED -> "Scan cancelled"
-                                                else -> "Camera is not available. Enter the pairing code instead."
+                                                else -> "Camera is not available. Enter the connection code instead."
                                             }
                                             externalUi = false; PairingHost.controller.notice(message)
                                         }
                                     }
-                                } catch (_: Exception) { scanning = false; externalUi = false; PairingHost.controller.notice("Camera is not available. Enter the pairing code instead.") }
+                                } catch (_: Exception) { scanning = false; externalUi = false; PairingHost.controller.notice("Camera is not available. Enter the connection code instead.") }
                             }) { Text(if (scanning) "Scanning..." else "Scan QR code") }
+                            Text("OR", style = MaterialTheme.typography.labelMedium)
                             OutlinedTextField(value = joinCode, onValueChange = { value ->
                                 val normalized = AutoPairing.input(value)
                                 if (normalized != null) {
@@ -193,20 +195,32 @@ class MainActivity : ComponentActivity() {
                                     PairingHost.controller.typed(normalized)
                                 } else {
                                     PairingHost.controller.typed("")
-                                    PairingHost.controller.notice("Invalid pairing code")
+                                    PairingHost.controller.notice("Invalid connection code")
                                 }
-                            }, enabled = !scanning, label = { Text("Pairing code") }, singleLine = true)
-
-                        }
-                        if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
-                            startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
-                        }) { Text("Stop") }
+                            }, enabled = !scanning, label = { Text("Connection code") }, singleLine = true)
+                            Button(modifier = Modifier.fillMaxWidth(), enabled = !scanning && !state.busy, onClick = {
+                                val code = PairingCode.normalize(joinCode)
+                                if (code != null) PairingHost.controller.join(code)
+                                else PairingHost.controller.notice("Invalid connection code")
+                            }) { Text("Connect") }
+                            }
+                            Text(if (home.phase == PairingPhase.STREAMING) "Sharing your screen" else when (home.phase) {
+                                PairingPhase.CREATING, PairingPhase.WAITING -> "Waiting for another device..."
+                                PairingPhase.CONSENT -> "Allow screen sharing"
+                                PairingPhase.STOPPED, PairingPhase.ERROR -> "Getting ready..."
+                                else -> "Connecting..."
+                            }, style = MaterialTheme.typography.bodyLarge)
+                            if (home.notice.isNotEmpty()) Text(ConnectionWorkflow.displayStatus(home.notice))
+                            if (rtc.busy) Button(enabled = rtc.status != "Allow screen sharing", onClick = {
+                                startService(Intent(this@MainActivity, WebRtcService::class.java).setAction(WebRtcService.STOP))
+                            }) { Text("Stop") }
+                            if (activePath == ConnectionWorkflow.SHOW && !rtc.busy) {
                         HorizontalDivider()
                         Text("Remote connection", style = MaterialTheme.typography.titleMedium)
                         Text("Use this link when the receiving device is far away.")
                         Text(remoteFeedback)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(modifier = Modifier.fillMaxWidth(), onClick = {
                                 try {
                                     val share = Intent(Intent.ACTION_SEND).apply {
                                         type = RemoteDevice.MIME_TYPE
@@ -215,15 +229,15 @@ class MainActivity : ComponentActivity() {
                                     }
                                     startActivity(Intent.createChooser(share, "Share link"))
                                 } catch (_: Exception) { remoteFeedback = "Link could not be shared. Please try again." }
-                            }) { Text("Share link") }
-                            Button(onClick = {
+                            }) { Text("Share connection link") }
+                            Button(modifier = Modifier.fillMaxWidth(), onClick = {
                                 try {
                                     val clip = ClipData.newPlainText("Screen sharing link", PairingHost.remoteLink())
                                     clip.description.extras = android.os.PersistableBundle().apply { putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true) }
                                     getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
                                     remoteFeedback = "Link copied"
                                 } catch (_: Exception) { remoteFeedback = "Link could not be copied. Please try again." }
-                            }) { Text("Copy link") }
+                            }) { Text("Copy connection link") }
                         }
                         TextButton(onClick = { regenerateRemote = true }) { Text("Regenerate link") }
                         Text("Anyone with this link can request a connection while this phone is waiting. Screen sharing still requires approval on the phone.")
@@ -237,6 +251,8 @@ class MainActivity : ComponentActivity() {
                                 catch (_: Exception) { remoteFeedback = "Link could not be replaced. Please try again." }
                             }) { Text("Regenerate") } },
                             dismissButton = { TextButton(onClick = { regenerateRemote = false }) { Text("Cancel") } })
+                            }
+                        }
                         TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide advanced diagnostics" else "Advanced diagnostics") }
                         if (diagnostics) {
                         Text("Media role: "+mediaMode.role.name)

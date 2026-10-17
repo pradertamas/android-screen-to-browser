@@ -6,6 +6,8 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -26,6 +28,30 @@ import org.webrtc.SurfaceViewRenderer
 class ReceiverActivity : ComponentActivity() {
     private lateinit var model: ReceiverViewModel
     private var renderer: SurfaceViewRenderer? = null
+    private var scanning by mutableStateOf(false)
+    private var sharingLink = false
+    private fun scanCode(done: (String) -> Unit, failure: (String) -> Unit) {
+        if (scanning || AppMediaRoles.role != MediaRole.RECEIVE || model.state.value.home.phase != ReceiverPhase.PAIRING) return
+        scanning = true
+        val options = com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(com.google.mlkit.vision.barcode.common.Barcode.FORMAT_QR_CODE).build()
+        try { com.google.mlkit.vision.codescanner.GmsBarcodeScanning.getClient(this, options).startScan()
+            .addOnSuccessListener { result ->
+                scanning = false
+                if (!isDestroyed && !isFinishing && AppMediaRoles.role == MediaRole.RECEIVE) {
+                    val code = PairingCode.parseQr(result.rawValue.orEmpty())
+                    if (code != null) done(code) else failure("QR code is not a valid connection code.")
+                }
+            }
+            .addOnCanceledListener { scanning = false }
+            .addOnFailureListener { error ->
+                scanning = false
+                if (!isDestroyed && !isFinishing) failure(if ((error as? com.google.mlkit.common.MlKitException)?.errorCode ==
+                    com.google.mlkit.common.MlKitException.CODE_SCANNER_CAMERA_PERMISSION_NOT_GRANTED)
+                    "Camera permission denied. Enter the connection code instead." else "Camera is not available. Enter the connection code instead.")
+            }
+        } catch (_: Exception) { scanning = false; failure("Camera is not available. Enter the connection code instead.") }
+    }
     private fun returnToSend(stopActive: Boolean = false) {
         if (AppMediaRoles.switchRole(MediaRole.SEND, stopActive)) finish()
     }
@@ -47,12 +73,19 @@ class ReceiverActivity : ComponentActivity() {
         })
         val appPairing = ViewModelProvider(this)[AppPairingViewModel::class.java]
         setContent {
+            val connectionShare = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { sharingLink = false }
             val ui by model.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
             val phase = ui.home.phase
+            var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var code by rememberSaveable { mutableStateOf("") }
             var diagnostics by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf("") }
+            LaunchedEffect(phase) {
+                // An external waiting-only scanner/share UI must not enable background receiving.
+                if (phase in setOf(ReceiverPhase.CONNECTING, ReceiverPhase.RECEIVING) &&
+                    !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) model.stop()
+            }
             DisposableEffect(phase) {
                 if (phase == ReceiverPhase.RECEIVING) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -61,16 +94,9 @@ class ReceiverActivity : ComponentActivity() {
             UICaptureTestTheme {
                 Surface(Modifier.fillMaxSize()) {
                     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
-                        Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Receive screen", style = MaterialTheme.typography.titleLarge)
+                        if (phase == ReceiverPhase.RECEIVING) Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Receiving", style = MaterialTheme.typography.titleLarge)
                             TextButton(onClick = { returnToSend(stopActive = true) }) { Text("Stop receiving") }
-                        }
-                        Column(Modifier.padding(horizontal = 12.dp)) {
-                            MediaRoleSelector(mediaMode.role, MediaRolePolicy.receiverSwitchAllowed(phase)) { requested ->
-                                if (requested == MediaRole.SEND) returnToSend()
-                            }
-                            if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                            if (phase != ReceiverPhase.RECEIVING) AppPairingSection(appPairing, MediaRolePolicy.receiverSwitchAllowed(phase))
                         }
                         Box(Modifier.weight(1f).fillMaxWidth()) {
                             // Keep a surface available behind the opaque pairing/connecting UI so the first frame can render.
@@ -79,26 +105,46 @@ class ReceiverActivity : ComponentActivity() {
                             if (phase != ReceiverPhase.RECEIVING) {
                                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
                                     .padding(20.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Text(ui.home.status)
-                                    if (phase == ReceiverPhase.PAIRING) {
-                                        if (ui.home.intent == PairingIntent.CREATE) {
-                                            Text("Pair with this screen")
-                                            Text(ui.home.code, style = MaterialTheme.typography.displayLarge)
-                                            val qr = remember(ui.home.code) { pairingQr(ui.home.code).asImageBitmap() }
-                                            Image(qr, "Pairing QR code", Modifier.size(220.dp))
-                                            Text("Scan this QR with the sharing phone or enter the code there.")
+                                    Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
+                                    Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
+                                    MediaRoleSelector(mediaMode.role, MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning) { requested ->
+                                        if (requested == MediaRole.SEND) returnToSend()
+                                    }
+                                    if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
+                                    val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
+                                    WorkflowStart(appPairing, canChoose, selectedPath) { selectedPath = it }
+                                    val activePath = selectedPath ?: if (phase == ReceiverPhase.CONNECTING) {
+                                        if (ui.home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
+                                    } else null
+                                    if (activePath != null) WorkflowPanel(activePath, canChoose, { code = ""; error = ""; selectedPath = null }) {
+                                        if (phase == ReceiverPhase.PAIRING) {
+                                            if (activePath == ConnectionWorkflow.SHOW && ui.home.intent == PairingIntent.CREATE) {
+                                                WorkflowOwnCode(ui.home.code) { url ->
+                                                    sharingLink = true
+                                                    try { connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                                        type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
+                                                    }, "Share connection link")) } catch (error: Exception) { sharingLink = false; throw error }
+                                                }
+                                                Text("Scan this QR with the sharing device or enter the code there.")
+                                            }
+                                            if (activePath == ConnectionWorkflow.CONNECT) {
+                                                Button(enabled = !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
+                                                Text("OR", style = MaterialTheme.typography.labelMedium)
+                                                OutlinedTextField(code, { value ->
+                                                    val normalized = AutoPairing.input(value)
+                                                    if (normalized != null) { code = normalized; error = "" }
+                                                    else error = "Invalid connection code"
+                                                }, enabled = !scanning, label = { Text("Connection code") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                                                Button(enabled = !scanning, modifier = Modifier.fillMaxWidth(), onClick = { if (!model.join(code)) error = "Invalid connection code" }) { Text("Connect") }
+                                            }
                                         }
-                                        OutlinedTextField(code, { value ->
-                                            val normalized = AutoPairing.input(value)
-                                            if (normalized != null) { code = normalized; error = "" }
-                                            else error = "Invalid pairing code"
-                                        }, label = { Text("Join a sharing phone's code") }, singleLine = true)
-                                        Button(onClick = { if (!model.join(code)) error = "Invalid pairing code" }) { Text("Join") }
+                                        Text(ConnectionWorkflow.displayStatus(ui.home.status))
                                         if (error.isNotEmpty()) Text(error)
+                                        if (phase == ReceiverPhase.ERROR || phase == ReceiverPhase.ENDED) {
+                                            Button(onClick = { code = ""; error = ""; model.retry() }) { Text("Retry receiving") }
+                                        }
                                     }
-                                    if (phase == ReceiverPhase.ERROR || phase == ReceiverPhase.ENDED) {
-                                        Button(onClick = { code = ""; error = ""; model.retry() }) { Text("Retry receiving") }
-                                    }
+
                                 }
                             }
                         }
@@ -114,7 +160,7 @@ class ReceiverActivity : ComponentActivity() {
         }
     }
     override fun onStop() {
-        if (::model.isInitialized && !isChangingConfigurations) model.stop()
+        if (::model.isInitialized && !isChangingConfigurations && !scanning && !sharingLink) model.stop()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }

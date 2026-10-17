@@ -31,6 +31,36 @@ class AppPairingViewModel(application: Application) : AndroidViewModel(applicati
     val state = mutable.asStateFlow()
     private val shareMutable = MutableStateFlow<String?>(null)
     val share = shareMutable.asStateFlow()
+    private val devicesMutable = MutableStateFlow<List<PairedDevice>>(emptyList())
+    val devices = devicesMutable.asStateFlow()
+    private val devicesMessageMutable = MutableStateFlow("")
+    val devicesMessage = devicesMessageMutable.asStateFlow()
+    private var loadingDevices = false
+    private var closed = false
+    fun refreshDevices() {
+        if (closed || loadingDevices || !config.configured) return
+        // Reading the list must not register a new installation/identity.
+        val identity = DeviceIdentityStorage.get(getApplication()).existing() ?: return
+        loadingDevices = true
+        worker.execute {
+            val result = runCatching {
+                val rows = api.listPairings(identity)
+                val devices = (0 until rows.length()).mapNotNull { index ->
+                    val row = rows.optJSONObject(index) ?: return@mapNotNull null
+                    PairedDevice.fromPublicId(row.optString("otherDeviceId"))
+                }
+                check(devices.size == rows.length()) // Unknown schema is not an empty device list.
+                devices.distinct()
+            }
+            main.post {
+                if (!closed) {
+                    loadingDevices = false
+                    result.fold({ devicesMutable.value = it; devicesMessageMutable.value = "" },
+                        { devicesMutable.value = emptyList(); devicesMessageMutable.value = "Saved connections are temporarily unavailable." })
+                }
+            }
+        }
+    }
     private var incoming: String? = null
     private val controller = AppPairingController(DeviceIdentityStorage.get(application), api,
         { action -> worker.execute(action) }, { action -> main.post { action() } }, { mutable.value = it }, { shareMutable.value = it }, config)
@@ -41,5 +71,5 @@ class AppPairingViewModel(application: Application) : AndroidViewModel(applicati
     fun cancel() { controller.cancel() }
     fun retry(allowed: Boolean) { controller.retry(allowed && AppMediaRoles.pairingAllowed()) }
     fun shared() { shareMutable.value = null }
-    override fun onCleared() { controller.close(); api.close(); worker.shutdownNow(); main.removeCallbacksAndMessages(null) }
+    override fun onCleared() { closed = true; controller.close(); api.close(); worker.shutdownNow(); main.removeCallbacksAndMessages(null) }
 }

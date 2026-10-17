@@ -10,7 +10,7 @@ import androidx.compose.ui.platform.LocalContext
 
 /** Control-plane UI only. Does not select media roles, start capture or open signaling. */
 @Composable
-fun AppPairingSection(model: AppPairingViewModel, allowed: Boolean) {
+fun AppPairingSection(model: AppPairingViewModel, allowed: Boolean, compact: Boolean = false) {
     val ui by model.state.collectAsState()
     val link by model.share.collectAsState()
     val context = LocalContext.current
@@ -23,26 +23,30 @@ fun AppPairingSection(model: AppPairingViewModel, allowed: Boolean) {
             if (token != null) runCatching {
                 context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                     type = "text/plain"; putExtra(Intent.EXTRA_TEXT, AppPairingLink.shareText(value, model.config))
-                }, "Share pairing link"))
+                }, "Share connection link"))
             }
         }
     }
+    var expanded by remember { mutableStateOf(false) }
     Column {
-        Text("Pair another device", style = MaterialTheme.typography.titleMedium)
-        if (!model.config.configured) Text("Pairing backend is not configured.")
-        Text("Create a temporary link to pair this app with another device.")
+        if (compact) TextButton(onClick = { expanded = !expanded }) { Text("Manage saved connections") }
+        if (!compact || expanded) {
+        Text("Save a device connection", style = MaterialTheme.typography.titleMedium)
+        if (!model.config.configured) Text("Connection service is not configured.")
+        Text("Create a temporary link to save a connection with another app installation.")
         val busy = ui.phase in setOf(AppPairingPhase.CREATING_INVITE, AppPairingPhase.INSPECTING_INVITE, AppPairingPhase.ACCEPTING)
         Button(enabled = model.config.configured && allowed && !busy && ui.phase != AppPairingPhase.AWAITING_CONFIRMATION,
-            onClick = { model.create(allowed) }) { Text("Share pairing link") }
-        Text("Pairing links expire after 30 minutes and can be used once.")
+            onClick = { model.create(allowed) }) { Text("Share connection link") }
+        Text("Connection links expire after 30 minutes and can be used once.")
         if (busy) Text("Please wait...")
-        if (ui.message.isNotEmpty()) Text(ui.message)
+        if (ui.message.isNotEmpty()) Text(ConnectionWorkflow.displayStatus(ui.message))
         if (ui.phase == AppPairingPhase.ERROR) Button(enabled = allowed && !busy, onClick = { model.retry(allowed) }) { Text("Retry") }
+        }
         if (ui.phase == AppPairingPhase.AWAITING_CONFIRMATION) AlertDialog(
             onDismissRequest = { model.cancel() },
-            title = { Text("Pair devices?") },
-            text = { Text("This will create a persistent pairing between the two app installations.") },
-            confirmButton = { TextButton(enabled = model.config.configured && allowed, onClick = { model.accept(allowed) }) { Text("Pair") } },
+            title = { Text("Save this device connection?") },
+            text = { Text("This saves a connection between the two app installations. Screen sharing does not start automatically.") },
+            confirmButton = { TextButton(enabled = model.config.configured && allowed, onClick = { model.accept(allowed) }) { Text("Save connection") } },
             dismissButton = { TextButton(onClick = { model.cancel() }) { Text("Cancel") } })
     }
 }

@@ -25,6 +25,7 @@ object AppPairingLink {
 }
 class DeviceIdentityStore(private val read: () -> DeviceIdentity?, private val write: (DeviceIdentity) -> Boolean) {
     companion object { const val PREFS = "device_identity" }
+    @Synchronized fun existing(): DeviceIdentity? = read()?.takeIf { AppPairingLink.valid(it.deviceId, 16) && AppPairingLink.valid(it.credential) }
     @Synchronized fun ensure(register: () -> DeviceIdentity): DeviceIdentity {
         val stored = read()
         if (stored != null && AppPairingLink.valid(stored.deviceId, 16) && AppPairingLink.valid(stored.credential)) return stored

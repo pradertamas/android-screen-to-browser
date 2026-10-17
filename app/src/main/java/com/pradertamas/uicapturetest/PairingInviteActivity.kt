@@ -35,7 +35,7 @@ class PairingInviteActivity : ComponentActivity() {
             UICaptureTestTheme {
                 Surface {
                     Column(Modifier.widthIn(max = 520.dp).padding(20.dp)) {
-                        Text("Device pairing", style = MaterialTheme.typography.headlineSmall)
+                        Text("Device connection", style = MaterialTheme.typography.headlineSmall)
                         AppPairingSection(model, mediaIdle)
                         TextButton(onClick = { model.cancel(); finish() }) { Text("Close") }
                     }
