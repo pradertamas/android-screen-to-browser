@@ -31,6 +31,9 @@ class AppPairingViewModel(application: Application) : AndroidViewModel(applicati
     val state = mutable.asStateFlow()
     private val shareMutable = MutableStateFlow<String?>(null)
     val share = shareMutable.asStateFlow()
+    private val shareErrorMutable = MutableStateFlow("")
+    val shareError = shareErrorMutable.asStateFlow()
+    private val shareDelivery = ConnectionShareDelivery(config, { shareMutable.value = it }, { shareErrorMutable.value = it })
     private val devicesMutable = MutableStateFlow<List<PairedDevice>>(emptyList())
     val devices = devicesMutable.asStateFlow()
     private val devicesMessageMutable = MutableStateFlow("")
@@ -63,13 +66,20 @@ class AppPairingViewModel(application: Application) : AndroidViewModel(applicati
     }
     private var incoming: String? = null
     private val controller = AppPairingController(DeviceIdentityStorage.get(application), api,
-        { action -> worker.execute(action) }, { action -> main.post { action() } }, { mutable.value = it }, { shareMutable.value = it }, config)
-    fun create(allowed: Boolean) { controller.create(allowed && AppMediaRoles.pairingAllowed()) }
-    fun incoming(uri: String) { incoming = uri }
+        { action -> worker.execute(action) }, { action -> main.post { action() } }, { mutable.value = it }, shareDelivery::offer, config)
+    fun create(allowed: Boolean) {
+        if (!allowed || !AppMediaRoles.pairingAllowed()) return
+        if (!shareDelivery.retry()) controller.create(true)
+    }
+    fun incoming(uri: String) { shareDelivery.clear(); incoming = uri }
     fun processIncoming(allowed: Boolean) { val uri = incoming ?: return; incoming = null; controller.incoming(uri, allowed) }
     fun accept(allowed: Boolean) { controller.accept(allowed && AppMediaRoles.pairingAllowed()) }
-    fun cancel() { controller.cancel() }
-    fun retry(allowed: Boolean) { controller.retry(allowed && AppMediaRoles.pairingAllowed()) }
-    fun shared() { shareMutable.value = null }
-    override fun onCleared() { closed = true; controller.close(); api.close(); worker.shutdownNow(); main.removeCallbacksAndMessages(null) }
+    fun cancel() { shareDelivery.clear(); controller.cancel() }
+    fun retry(allowed: Boolean) {
+        if (!allowed || !AppMediaRoles.pairingAllowed()) return
+        if (!shareDelivery.retry()) controller.retry(true)
+    }
+    fun shared(expected: String): String? = shareDelivery.take(expected)
+    fun shareFailed(link: String) { shareDelivery.launchFailed(link) }
+    override fun onCleared() { closed = true; shareDelivery.clear(); controller.close(); api.close(); worker.shutdownNow(); main.removeCallbacksAndMessages(null) }
 }

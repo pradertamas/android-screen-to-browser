@@ -93,3 +93,28 @@ identity tests plus existing role, receiver, disconnect grace, cancellation,
 rotation, persistent invite and backup-exclusion tests. Lint: 0 errors, 26 warnings.
 No connected-device/instrumentation or live NAS request was run. This is not a
 physical streaming/scanner/paired-list PASS; execute the physical matrix above.
+
+## Persistent invite Share Sheet delivery fix
+
+The Step 2 button already called AppPairingViewModel.create -> controller.create
+-> existing backend create -> full invite URL -> share event. There was no hidden
+second share action. The audited UI delivery had two defects: lifecycle detection
+required LocalContext to be a ComponentActivity, and chooser launch failure was
+silently discarded after consuming the link. Code alone does not establish which
+branch caused the reported physical failure; no device trace was collected.
+
+AppPairingSection now uses LocalLifecycleOwner and an Activity Result launcher for
+ACTION_SEND/text/plain with the existing full-link share text and native chooser.
+A ViewModel-owned memory-only event is claimed once before launch. Native launch
+failure is visible and preserves the same invite for explicit Retry; it does not
+create another invite or replay automatically on resume/recomposition. New incoming
+invites, Cancel and ViewModel disposal clear pending/failed share state. A fresh
+process does not restore bearer links from saved state. Backend expiry/single-use
+remain authoritative and unchanged; a retained failed-launch link may expire under
+those existing rules. No connection/session/media action is added.
+
+Physical retest: Step 2 Share -> creating indication -> native chooser -> choose a
+share app and verify the entire /pair#invite URL. Cancel chooser, return, rotate:
+no second chooser without a new user action. Test unavailable API (inline Retry,
+no chooser), then recovery. Test the same in SEND and RECEIVE waiting states and
+from the floating App Link entry. Verify accepting an invite does not start media.
