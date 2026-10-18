@@ -149,4 +149,21 @@ class ConnectionWorkflowTest {
             assertNotNull(ConnectionWorkflow.title(path)) // Both paths use the same activePath gate.
         }
     }
+    @Test fun rootDiagnosticsFollowWorkflowInsideThePaddedScrollableColumn() {
+        val receiver = text("ReceiverActivity.kt")
+        val rootColumn = receiver.substringAfter(".padding(24.dp).verticalScroll(taskScroll)")
+            .substringBefore("if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()")
+        assertTrue(rootColumn.contains("Arrangement.spacedBy(12.dp)"))
+        assertTrue(rootColumn.indexOf("WorkflowStart(") < rootColumn.indexOf("if (activePath == null) diagnosticsContent()"))
+        assertTrue(rootColumn.contains("if (activePath == null) diagnosticsContent()"))
+        assertTrue(receiver.contains("if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()"))
+        val content = receiver.substringAfter("val diagnosticsContent: @Composable () -> Unit = {").substringBefore("LaunchedEffect(phase)")
+        assertTrue(content.contains("diagnostics = !diagnostics"))
+        assertTrue(content.contains("if (diagnostics) Column"))
+        assertTrue(content.contains("heightIn(max = 220.dp)"))
+        assertTrue(content.contains("Text(ui.metrics)")); assertTrue(content.contains("Current received video:"))
+        val main = text("MainActivity.kt")
+        assertTrue(main.indexOf("WorkflowStart(") < main.indexOf("TextButton(onClick = { diagnostics"))
+        assertTrue(main.contains("if (activePath == null) {\n                        TextButton(onClick = { diagnostics"))
+    }
 }

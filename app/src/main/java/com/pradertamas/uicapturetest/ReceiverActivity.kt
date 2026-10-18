@@ -90,6 +90,14 @@ class ReceiverActivity : ComponentActivity() {
             val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
             var diagnostics by remember { mutableStateOf(false) }
             var error by remember { mutableStateOf("") }
+            val diagnosticsContent: @Composable () -> Unit = {
+                        TextButton(onClick = { diagnostics = !diagnostics }) { Text("Advanced diagnostics") }
+                        if (diagnostics) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(12.dp)) {
+                            Text("Media role: "+mediaMode.role.name)
+                            Text("Current received video: ${ui.resolution}")
+                            Text(ui.metrics)
+                        }
+            }
             LaunchedEffect(phase) {
                 // An external waiting-only scanner/share UI must not enable background receiving.
                 if (phase in setOf(ReceiverPhase.CONNECTING, ReceiverPhase.RECEIVING) &&
@@ -159,18 +167,12 @@ class ReceiverActivity : ComponentActivity() {
                                             Button(onClick = { code = ""; error = ""; model.retry() }) { Text("Retry receiving") }
                                         }
                                     }
+                                    if (activePath == null) diagnosticsContent()
 
                                 }
                             }
                         }
-                        if (activePath == null) {
-                        TextButton(onClick = { diagnostics = !diagnostics }) { Text("Advanced diagnostics") }
-                        if (diagnostics) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(12.dp)) {
-                            Text("Media role: "+mediaMode.role.name)
-                            Text("Current received video: ${ui.resolution}")
-                            Text(ui.metrics)
-                        }
-                        }
+                        if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()
                     }
                 }
             }
