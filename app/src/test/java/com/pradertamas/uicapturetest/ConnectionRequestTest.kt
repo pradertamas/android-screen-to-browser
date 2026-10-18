@@ -54,7 +54,7 @@ class ConnectionRequestTest {
                 ConnectionRequestWireResponse(result.code, json.toString(), result.retryAfterSeconds)
             } else result
         })
-        val controller = ConnectionRequestController(api, queue)
+        val controller = ConnectionRequestController(api, queue, elapsedMs = { 0 })
         fun create(role: MediaRole = MediaRole.SEND) { controller.create(role); queue.run() }
         fun response(state: String, code: Int = 200, role: String = "send", modify: (JSONObject) -> Unit = {}) {
             respond = { _, _ -> ConnectionRequestWireResponse(code, body(state, role).also(modify).toString()) }
@@ -150,7 +150,7 @@ class ConnectionRequestTest {
     @Test fun baseUrlDerivedWithoutChangingSignaling() { assertEquals("https://realtime-relay-k28l.onrender.com", ConnectionRequestConfig.httpBase()); assertTrue(WebRtcConfig.RELAY.startsWith("wss://")) }
     @Test fun claimFactoryRunsBeforeWorkerAndOnlyOnce() {
         val f = Fixture(); var generated = 0
-        val c = ConnectionRequestController(f.api, f.queue) { generated++; ConnectionRequestSecrets.claim() }
+        val c = ConnectionRequestController(f.api, f.queue, elapsedMs = { 0 }) { generated++; ConnectionRequestSecrets.claim() }
         c.preview(id, capability, MediaRole.SEND); c.accept()
         assertEquals(1, generated); assertTrue(f.calls.isEmpty())
         f.respond = { _, _ -> throw IOException() }; f.queue.run(); c.accept(); assertEquals(1, generated)
@@ -200,7 +200,7 @@ class ConnectionRequestTest {
     }
     @Test fun twoQuickAcceptsOneClaimAndOneHttp() {
         val f = Fixture(); var generated = 0
-        val c = ConnectionRequestController(f.api, f.queue) { generated++; ConnectionRequestSecrets.claim() }
+        val c = ConnectionRequestController(f.api, f.queue, elapsedMs = { 0 }) { generated++; ConnectionRequestSecrets.claim() }
         c.preview(id, capability, MediaRole.SEND); f.response("ACCEPTED")
         c.accept(); c.accept(); assertEquals(1, generated); assertEquals(ConnectionRequestError.OPERATION_IN_PROGRESS, c.state.value.error)
         f.queue.run(); assertEquals(1, f.calls.size); assertEquals(ConnectionRequestState.ACCEPTED, c.state.value.request?.state)
@@ -360,7 +360,7 @@ class ConnectionRequestTest {
     @Test fun wrongSchemeRejectedSafely() { for (url in listOf("https://example.com/ws", "file:///ws", "bad")) assertNull(ConnectionRequestConfig.httpBase(url)) }
     @Test fun badConfigControllerNoCrashOrRawUrl() {
         val queue = Queue(); val url = "wrong://$initiator@host/ws"
-        val controller = ConnectionRequestController(ConnectionRequestApiClient(ConnectionRequestOkHttpTransport(url)), queue)
+        val controller = ConnectionRequestController(ConnectionRequestApiClient(ConnectionRequestOkHttpTransport(url)), queue, elapsedMs = { 0 })
         controller.create(MediaRole.SEND); queue.run()
         assertEquals(ConnectionRequestError.CONFIGURATION, controller.state.value.error)
         assertNull(controller.state.value.operation); assertFalse(controller.state.value.toString().contains(initiator))

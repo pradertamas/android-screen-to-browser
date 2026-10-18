@@ -18,7 +18,8 @@ internal data class RequestShareUi(val busy: Boolean = false, val delivery: Long
 internal class ConnectionRequestShareCoordinator(
     private val controller: ConnectionRequestController,
     private val arm: () -> Unit = ConnectionRequestRuntimeGate::armRequestFirst,
-    private val release: () -> Unit = ConnectionRequestRuntimeGate::releaseRequestFirst
+    private val release: () -> Unit = ConnectionRequestRuntimeGate::releaseRequestFirst,
+    private val legacyStartAllowed: () -> Boolean = ConnectionRequestRuntimeGate::legacyStartAllowed
 ) {
     private val lock = Any()
     private val mutable = MutableStateFlow(RequestShareUi())
@@ -26,6 +27,7 @@ internal class ConnectionRequestShareCoordinator(
     private var owner: ConnectionRequestShareOwner? = null
     private var role: MediaRole? = null
     private var creating = false
+    private var attempt: ConnectionRequestCreateAttempt? = null
     private var sequence = 0L
 
     fun start(owner: ConnectionRequestShareOwner, role: MediaRole, stopLegacy: () -> Unit) = synchronized(lock) {
@@ -36,7 +38,12 @@ internal class ConnectionRequestShareCoordinator(
             mutable.value = RequestShareUi(error = RequestShareError.UNAVAILABLE); return@synchronized
         }
         this.owner = owner; this.role = role
+        attempt = null
         mutable.value = RequestShareUi(busy = true)
+        if (!legacyStartAllowed() && controller.shareableInitiatorData(role) != null) {
+            mutable.value = RequestShareUi(busy = true, delivery = ++sequence)
+            return@synchronized
+        }
         arm()
         try { stopLegacy() } catch (_: Exception) {
             // Quiet state was not established. Keep the gate armed; never start HTTP/chooser.
@@ -47,7 +54,7 @@ internal class ConnectionRequestShareCoordinator(
             mutable.value = RequestShareUi(busy = true, delivery = ++sequence)
         } else {
             creating = true
-            controller.create(role)
+            attempt = controller.create(role)
             onRequestState(controller.state.value)
         }
     }
@@ -57,13 +64,14 @@ internal class ConnectionRequestShareCoordinator(
         if (controller.state.value != snapshot) return@synchronized
         creating = false
         val requested = role
-        if (requested != null && controller.shareableInitiatorData(requested) != null) {
+        val expected = attempt
+        if (expected != null && requested != null && controller.shareableInitiatorData(requested, expected) != null) {
             if (owner != null) mutable.value = RequestShareUi(busy = true, delivery = ++sequence)
             else { role = null; mutable.value = RequestShareUi() }
         } else {
             // Existing controller replacement policy deliberately retires the old local context.
             // Release only with no current active request/context/operation; never resurrect it.
-            if (snapshot.request == null && snapshot.side == null && snapshot.operation == null) release()
+            if (expected != null) controller.ifEmptyCurrentCreateAttempt(expected, release)
             owner = null; role = null
             mutable.value = RequestShareUi(error = RequestShareError.CREATE_FAILED)
         }
@@ -73,7 +81,7 @@ internal class ConnectionRequestShareCoordinator(
         if (this.owner !== owner || mutable.value.delivery != delivery) return@synchronized null
         mutable.value = RequestShareUi(busy = true)
         val requested = role
-        val data = if (requested == currentRole) controller.shareableInitiatorData(currentRole) else null
+        val data = if (requested == currentRole) controller.shareableInitiatorData(currentRole, attempt) else null
         val link = data?.let(ConnectionRequestLink::build)
         if (link == null) {
             this.owner = null; role = null; mutable.value = RequestShareUi(error = RequestShareError.UNAVAILABLE)

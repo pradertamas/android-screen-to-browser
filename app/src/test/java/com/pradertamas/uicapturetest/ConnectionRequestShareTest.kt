@@ -21,16 +21,19 @@ class ConnectionRequestShareTest {
         val queue = Queue()
         val gate = LegacyConnectionStartGate()
         var elapsed = 0L
+        var ttlMs = 300_000L
         var creates = 0; var cancels = 0
         var createError: ConnectionRequestError? = null
         var cancelError: ConnectionRequestError? = null
         var serverState = ConnectionRequestState.WAITING
         var createdRole: MediaRole? = null
+        var onCreate: (() -> Unit)? = null
         val api = object : ConnectionRequestApi {
             override fun create(role: MediaRole): ConnectionRequestResult {
                 events.add("create"); creates++; createdRole = role
                 createError?.let { return ConnectionRequestResult(error = it) }
                 val m = metadata(role)
+                onCreate?.also { onCreate = null }?.invoke()
                 return ConnectionRequestResult(m, httpStatus = 201, created = ConnectionRequestCreated(m,
                     ConnectionCredential(token(32, 17)), ConnectionCredential(token(16, 18))))
             }
@@ -47,10 +50,10 @@ class ConnectionRequestShareTest {
             override fun session(id: String, auth: ConnectionCredential): ConnectionRequestResult = error("No session in Share")
         }
         fun metadata(role: MediaRole) = ConnectionRequestMetadata(token(16, creates), ConnectionRequestState.WAITING,
-            Instant.parse("2026-01-01T00:00:00Z"), role, expiresAt = Instant.parse("2026-01-01T00:05:00Z"))
-        val controller = ConnectionRequestController(api, queue, elapsedNanos = { elapsed })
+            Instant.parse("2026-01-01T00:00:00Z"), role, expiresAt = Instant.parse("2026-01-01T00:00:00Z").plusMillis(ttlMs))
+        val controller = ConnectionRequestController(api, queue, elapsedMs = { elapsed })
         val coordinator = ConnectionRequestShareCoordinator(controller,
-            { events.add("arm"); gate.armRequestFirst() }, { events.add("release"); gate.releaseRequestFirst() })
+            { events.add("arm"); gate.armRequestFirst() }, { events.add("release"); gate.releaseRequestFirst() }, gate::legacyStartAllowed)
         val owner = ConnectionRequestShareOwner()
         fun start(role: MediaRole = MediaRole.SEND, o: ConnectionRequestShareOwner = owner) {
             coordinator.start(o, role) { assertFalse(gate.legacyStartAllowed()); events.add("stop") }
@@ -125,7 +128,7 @@ class ConnectionRequestShareTest {
     }
     @Test fun malformedHttpCreateDoesNotOfferChooser() {
         val queue = Queue(); val gate = LegacyConnectionStartGate()
-        val controller = ConnectionRequestController(ConnectionRequestApiClient(ConnectionRequestTransport { _, _, _, _ -> ConnectionRequestWireResponse(201, "bad-json") }), queue)
+        val controller = ConnectionRequestController(ConnectionRequestApiClient(ConnectionRequestTransport { _, _, _, _ -> ConnectionRequestWireResponse(201, "bad-json") }), queue, elapsedMs = { 0 })
         val coordinator = ConnectionRequestShareCoordinator(controller, gate::armRequestFirst, gate::releaseRequestFirst)
         coordinator.start(ConnectionRequestShareOwner(), MediaRole.SEND) {}
         queue.run(); coordinator.onRequestState(controller.state.value)
@@ -184,7 +187,7 @@ class ConnectionRequestShareTest {
     }
     @Test fun elapsedExpiryDoesNotReshareEvenWithWrongPhoneWallClock() {
         val f = Fixture(); f.start(); f.finish(); val old = f.link(); f.coordinator.chooserReturned(f.owner)
-        f.elapsed = 300_000_000_000L; f.start(); f.finish()
+        f.elapsed = 300_000L; f.start(); f.finish()
         assertEquals(2, f.creates); assertNotEquals(old, f.link())
     }
     @Test fun replacementCancelFailureAndCreateFailureReleaseOnlyEmptyLocalOwner() {
@@ -257,6 +260,102 @@ class ConnectionRequestShareTest {
         f.finish()
         assertEquals(1, opens); assertEquals(1, f.creates)
         assertEquals(ReceiverPhase.ENDED, engine.home.phase)
+    }
+    @Test fun productionClockIncludesDeepSleepAndDoesNotUseUptime() {
+        val text = source("ConnectionRequestController")
+        assertTrue(text.contains("android.os.SystemClock::elapsedRealtime"))
+        assertFalse(text.contains("System::nanoTime")); assertFalse(text.contains("uptimeMillis"))
+    }
+    @Test fun fourMinutesReusableThenSixMinutesExpired() {
+        val f = Fixture(); f.start(); f.finish(); f.link(); f.coordinator.chooserReturned(f.owner)
+        f.elapsed = 240_000; assertNotNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        f.elapsed += 120_000; assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        f.start(); f.finish(); assertEquals(2, f.creates); assertNotNull(f.link())
+    }
+    @Test fun tenMinuteSleepJumpInvalidatesWaitingLink() {
+        val f = Fixture(); f.start(); f.finish()
+        f.elapsed = 600_000
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND)); assertNull(f.link())
+    }
+    @Test fun networkLatencyDoesNotExtendDeadline() {
+        val f = Fixture(); f.onCreate = { f.elapsed = 299_999 }; f.start(); f.finish()
+        assertNotNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        f.elapsed = 300_000; assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+    }
+    @Test fun deadlineUsesServerTtlRatherThanClientFiveMinuteConstant() {
+        val f = Fixture(); f.ttlMs = 120_000; f.start(); f.finish()
+        f.elapsed = 119_999; assertNotNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        f.elapsed = 120_000; assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+    }
+    @Test fun statusRefreshCannotExtendOriginalDeadline() {
+        val f = Fixture(); f.start(); f.finish()
+        f.elapsed = 299_000; f.controller.refreshStatus(); f.queue.run()
+        f.elapsed = 300_000; assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+    }
+    @Test fun replacementGetsIndependentDeadline() {
+        val f = Fixture(); f.start(); f.finish(); f.link(); f.coordinator.chooserReturned(f.owner)
+        f.elapsed = 200_000; f.start(MediaRole.RECEIVE); f.finish()
+        f.elapsed = 300_001; assertNotNull(f.controller.shareableInitiatorData(MediaRole.RECEIVE))
+        f.elapsed = 500_000; assertNull(f.controller.shareableInitiatorData(MediaRole.RECEIVE))
+    }
+    @Test fun createReturnsOpaqueAttemptAndTagsOnlyItsOwnContext() {
+        val f = Fixture(); val a = f.controller.create(MediaRole.SEND)!!
+        assertEquals("ConnectionRequestCreateAttempt[redacted]", a.toString())
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND, a))
+        f.queue.run(); assertNotNull(f.controller.shareableInitiatorData(MediaRole.SEND, a))
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND, ConnectionRequestCreateAttempt()))
+    }
+    @Test fun locallyRejectedCreateReturnsNoAttempt() {
+        val f = Fixture(); f.controller.preview(token(16, 1), token(16, 2), MediaRole.SEND)
+        assertNull(f.controller.create(MediaRole.SEND)); assertTrue(f.queue.tasks.isEmpty())
+    }
+    private fun superseded(role: MediaRole) {
+        val f = Fixture(); f.start()
+        val b = f.controller.create(role)!!
+        f.finish()
+        assertNull(f.ui.delivery); assertFalse(f.ui.busy); assertFalse(f.gate.legacyStartAllowed())
+        assertNotNull(f.controller.shareableInitiatorData(role, b))
+        f.start(role); f.finish(); assertNotNull(f.link(role)); assertEquals(1, f.creates)
+    }
+    @Test fun sameRoleExternalAttemptCannotSatisfyShare() = superseded(MediaRole.SEND)
+    @Test fun differentRoleExternalAttemptCannotSatisfyShare() = superseded(MediaRole.RECEIVE)
+    @Test fun lateAResponseAfterBSuccessDoesNotDeliverAOrBForOldShare() {
+        val f = Fixture()
+        f.onCreate = { f.controller.create(MediaRole.SEND); f.queue.run() }
+        f.start(); f.finish()
+        assertEquals(2, f.creates); assertNull(f.ui.delivery); assertFalse(f.ui.busy)
+        assertEquals(1, f.cancels) // Stale A successful response is retired best-effort.
+        f.start(); f.finish(); assertNotNull(f.link()); assertEquals(2, f.creates)
+    }
+    @Test fun replacingCreateAfterDeliveryCannotDeliverForeignLink() {
+        val f = Fixture(); f.start(); f.finish()
+        f.controller.create(MediaRole.SEND); f.queue.run()
+        assertNull(f.link()); assertFalse(f.ui.busy)
+    }
+    @Test fun supersededFailureCannotReleaseAnotherAttemptsGate() {
+        val f = Fixture(); f.start(); f.controller.create(MediaRole.SEND)
+        f.createError = ConnectionRequestError.NETWORK; f.finish()
+        assertFalse(f.ui.busy); assertNull(f.ui.delivery); assertFalse(f.gate.legacyStartAllowed())
+    }
+    @Test fun emptyAttemptCompletionPolicyRejectsStaleAttemptAndActiveContext() {
+        val f = Fixture(); val a = f.controller.create(MediaRole.SEND)!!
+        val b = f.controller.create(MediaRole.SEND)!!; var releases = 0
+        f.controller.ifEmptyCurrentCreateAttempt(a) { releases++ }
+        f.controller.ifEmptyCurrentCreateAttempt(b) { releases++ }
+        assertEquals(0, releases)
+        f.queue.run(); f.controller.ifEmptyCurrentCreateAttempt(b) { releases++ }
+        assertEquals(0, releases)
+        f.controller.clear(); f.controller.ifEmptyCurrentCreateAttempt(b) { releases++ }
+        assertEquals(0, releases)
+    }
+    @Test fun validArmedReshareDoesNotArmOrStopAgain() {
+        val f = Fixture(); f.start(); f.finish(); val first = f.link(); f.coordinator.chooserReturned(f.owner)
+        f.events.clear(); f.start(); assertTrue(f.events.isEmpty()); assertEquals(first, f.link())
+    }
+    @Test fun validUnarmedReshareArmsThenStopsWithoutCreate() {
+        val f = Fixture(); f.start(); f.finish(); val first = f.link(); f.coordinator.chooserReturned(f.owner)
+        f.gate.releaseRequestFirst(); f.events.clear(); f.start()
+        assertEquals(listOf("arm", "stop"), f.events); assertEquals(first, f.link()); assertEquals(1, f.creates)
     }
     private fun source(name: String): String {
         val path = "src/main/java/com/pradertamas/uicapturetest/$name.kt"

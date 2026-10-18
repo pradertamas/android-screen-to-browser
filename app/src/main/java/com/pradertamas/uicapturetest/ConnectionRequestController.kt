@@ -5,21 +5,28 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
+/** Local identity only; never a wire credential or public UI identifier. */
+internal class ConnectionRequestCreateAttempt internal constructor() {
+    override fun toString() = "ConnectionRequestCreateAttempt[redacted]"
+}
+
 /** Blocking HTTP lives on a serial worker; all context/publication changes share one lock.
  * No Activity, storage, polling, media-role mutation or automatic session start. */
 class ConnectionRequestController(
     private val api: ConnectionRequestApi,
     private val worker: Executor = Executors.newSingleThreadExecutor(),
-    private val elapsedNanos: () -> Long = System::nanoTime,
+    private val elapsedMs: () -> Long = android.os.SystemClock::elapsedRealtime,
     private val claimFactory: () -> ConnectionCredential = ConnectionRequestSecrets::claim
 ) {
     private class Context(val side: ConnectionRequestSide, var metadata: ConnectionRequestMetadata?,
         val id: String, val role: MediaRole, val capability: ConnectionCredential,
         val initiatorSecret: ConnectionCredential? = null, var claim: ConnectionCredential? = null,
-        var won: Boolean = false, var observedAtNanos: Long = 0)
+        var won: Boolean = false, val expiryElapsedMs: Long? = null,
+        val originAttempt: ConnectionRequestCreateAttempt? = null)
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
+    private var currentCreateAttempt: ConnectionRequestCreateAttempt? = null
     private var activeOperation: ConnectionRequestOperation? = null
     private val mutable = MutableStateFlow(ConnectionRequestUiState())
     val state = mutable.asStateFlow()
@@ -49,12 +56,15 @@ class ConnectionRequestController(
 
     /** Replacement Cancel is best-effort. Its failure is exposed on the new snapshot,
      * but never restores the old local context. The old server request may await expiry. */
-    fun create(role: MediaRole) = synchronized(lock) {
+    internal fun create(role: MediaRole): ConnectionRequestCreateAttempt? = synchronized(lock) {
         val old = context
         if (old?.metadata?.state == ConnectionRequestState.CONNECTED || old?.side == ConnectionRequestSide.RECIPIENT) {
-            rejected(); return@synchronized
+            rejected(); return@synchronized null
         }
         val token = ++generation
+        val attempt = ConnectionRequestCreateAttempt()
+        currentCreateAttempt = attempt
+        val started = elapsedMs()
         context = null; activeOperation = ConnectionRequestOperation.CREATE; publish(null, activeOperation)
         worker.execute {
             val cancellation = if (old?.metadata?.state?.activeSetup == true)
@@ -69,8 +79,13 @@ class ConnectionRequestController(
                     activeOperation = null
                     val created = result.created
                     if (created != null && result.error == null && created.metadata.initiatorRole == role) {
+                        // Create guarantees serverNow = creation time, expiresAt = creation + TTL.
+                        // Anchor BEFORE HTTP/cancel latency; never extend validity on status refresh.
+                        val ttl = runCatching { java.time.Duration.between(created.metadata.serverNow,
+                            created.metadata.expiresAt).toMillis() }.getOrNull()
+                        val deadline = ttl?.takeIf { it > 0 }?.let { runCatching { Math.addExact(started, it) }.getOrNull() }
                         context = Context(ConnectionRequestSide.INITIATOR, created.metadata, created.metadata.requestId,
-                            role, created.capability, created.initiatorSecret, observedAtNanos = elapsedNanos())
+                            role, created.capability, created.initiatorSecret, expiryElapsedMs = deadline, originAttempt = attempt)
                         publish(context, error = cancellation?.error)
                     } else publish(null, error = result.error ?: ConnectionRequestError.INVALID_RESPONSE)
                 }
@@ -78,24 +93,32 @@ class ConnectionRequestController(
             // A lost local race must not leave a second known active initiator request.
             abandoned?.let { safe { api.cancel(it.metadata.requestId, it.initiatorSecret) } }
         }
+        attempt
     }
     fun preview(id: String, capability: String, initiatorRole: MediaRole) = synchronized(lock) {
         if (context != null || mutable.value.operation != null || !ConnectionRequestSecrets.canonical(id, 16) ||
             !ConnectionRequestSecrets.canonical(capability, 16)) { rejected(); return@synchronized }
         ++generation
+        currentCreateAttempt = null
         context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability))
         publish(context)
     }
+    /** Atomic completion policy: a superseding create cannot slip between validation and release.
+     * The callback must be a short synchronous policy update, never I/O. */
+    internal fun ifEmptyCurrentCreateAttempt(attempt: ConnectionRequestCreateAttempt, action: () -> Unit) = synchronized(lock) {
+        if (currentCreateAttempt === attempt && context == null && activeOperation == null) action()
+    }
     /** Narrow, memory-only explicit-share access. Never exposes initiator/claim authority.
-     * Use server remaining lifetime + elapsed time, not the phone's wall clock. */
-    internal fun shareableInitiatorData(role: MediaRole): ConnectionRequestShareData? = synchronized(lock) {
+     * Validity uses the original boot-relative deadline, never the phone's wall clock. */
+    internal fun shareableInitiatorData(role: MediaRole,
+        expectedCreateAttempt: ConnectionRequestCreateAttempt? = null): ConnectionRequestShareData? = synchronized(lock) {
         val c = context ?: return@synchronized null
         val m = c.metadata ?: return@synchronized null
         if (activeOperation != null || c.side != ConnectionRequestSide.INITIATOR || c.role != role ||
             m.state != ConnectionRequestState.WAITING || m.expiresAt == null) return@synchronized null
-        val remaining = runCatching { java.time.Duration.between(m.serverNow, m.expiresAt).toNanos() }.getOrNull()
-            ?: return@synchronized null
-        if ((elapsedNanos() - c.observedAtNanos).coerceAtLeast(0) >= remaining) return@synchronized null
+        if (expectedCreateAttempt != null && c.originAttempt !== expectedCreateAttempt) return@synchronized null
+        val deadline = c.expiryElapsedMs ?: return@synchronized null
+        if (elapsedMs() >= deadline) return@synchronized null
         ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
     fun refreshStatus() = operation(ConnectionRequestOperation.STATUS, { true }) {
@@ -125,7 +148,7 @@ class ConnectionRequestController(
         it.side == ConnectionRequestSide.INITIATOR && it.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)
     }) { api.session(it.id, checkNotNull(it.initiatorSecret)) }
     /** Local-only cleanup; callers must explicitly Cancel/withdraw before leaving live setup. */
-    fun clear() = synchronized(lock) { ++generation; context = null; activeOperation = null; publish(null) }
+    fun clear() = synchronized(lock) { ++generation; currentCreateAttempt = null; context = null; activeOperation = null; publish(null) }
     private fun operation(op: ConnectionRequestOperation, allowed: (Context) -> Boolean,
         prepare: (Context) -> Unit = {}, call: (Context) -> ConnectionRequestResult) = synchronized(lock) {
         val c = context
@@ -150,7 +173,6 @@ class ConnectionRequestController(
                     publish(c, error = ConnectionRequestError.INVALID_RESPONSE); return@synchronized
                 }
                 if (update != null) {
-                    c.observedAtNanos = elapsedNanos()
                     val old = c.metadata
                     // Cancel/withdraw/readiness responses intentionally contain only a small projection.
                     c.metadata = update.copy(initiatorRole = c.role, createdAt = update.createdAt ?: old?.createdAt,
