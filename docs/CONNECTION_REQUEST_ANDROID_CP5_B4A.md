@@ -17,23 +17,32 @@ the request's initiator role is eligible, and the current AppMediaRoles role mus
 also match. A role-state change re-evaluates eligibility without switching roles.
 
 An eligible active initiator context triggers immediate refresh on foreground entry,
-resume or request replacement. Active states are WAITING, ACCEPTED and CONNECTING.
+resume or request replacement, unless the same request still has server backoff.
+Active states are WAITING, ACCEPTED and CONNECTING.
 CONNECTED, CANCELED, EXPIRED and FAILED stop timing. Recipient contexts never poll.
 The monitor keeps only the existing opaque create-attempt identity to distinguish
 request replacement; it never retains full request metadata or wire identifiers.
 
 ## Scheduling and controller boundary
 
-After status completion (success or failure), the next attempt is scheduled after
-max(2000 milliseconds, Retry-After seconds * 1000). Conversion saturates safely at
-Long.MAX_VALUE for extreme Retry-After values rather than wrapping to an early poll.
+Normal 2000 millisecond cadence is foreground-only. Server Retry-After is separate:
+after STATUS completion, a positive value establishes a private monotonic deadline
+using injected elapsed milliseconds (production: SystemClock.elapsedRealtime()).
+The next foreground poll waits max(2000 milliseconds, remaining server backoff).
+Both seconds conversion and deadline addition saturate safely at Long.MAX_VALUE
+rather than wrapping to an early poll. Null/zero Retry-After clears server backoff.
 Duplicate state emits do not create another GET or timer. A synchronous completion
 also schedules the next attempt instead of recursively starting more GETs.
 
 No eligible RESUMED owner means cancel the future. A canceled callback is epoch
 guarded even if already queued. An operation admitted while foreground may complete
-after pause; completion while background does not schedule another request. Resume
-starts an immediate attempt instead of retaining the previous timer deadline. If a
+after pause; completion while background records server backoff without scheduling
+another request. Background cancels normal cadence, but preserves server backoff
+for the exact opaque target. Early resume waits the remaining backoff; resume after
+expiry (or without backoff) refreshes immediately. Request replacement, including
+same-role replacement, never inherits the old target's backoff. Terminal/CONNECTED,
+recipient or absent contexts discard the old backoff. Process death may lose it
+under V1 policy; no persistence is introduced. If a
 GET is already active, it satisfies that refresh and its completion starts cadence.
 
 refreshInitiatorStatus(expectedRole, expectedFlow) checks side, role, opaque context

@@ -17,13 +17,14 @@ class ConnectionRequestInitiatorMonitorTest {
     }
     private class Clock : ConnectionRequestPollScheduler {
         data class Task(val delay: Long, val action: () -> Unit, var cancelled: Boolean = false, var fired: Boolean = false)
+        var now = 0L
         val tasks = mutableListOf<Task>()
         val active get() = tasks.filter { !it.cancelled && !it.fired }
         override fun later(delayMillis: Long, action: () -> Unit): () -> Unit {
             val task = Task(delayMillis, action); tasks.add(task)
             return { task.cancelled = true }
         }
-        fun fire() { val task = active.single(); task.fired = true; task.action() }
+        fun fire() { val task = active.single(); now = Math.addExact(now, task.delay); task.fired = true; task.action() }
     }
     private inner class Fixture(initialRole: MediaRole = MediaRole.SEND, synchronous: Boolean = false) {
         val queue = Queue(); val clock = Clock(); val owner = ConnectionRequestForegroundOwner()
@@ -64,7 +65,7 @@ class ConnectionRequestInitiatorMonitorTest {
         }
         val worker = if (synchronous) Executor { it.run() } else queue
         val controller = ConnectionRequestController(api, worker, elapsedMs = { 0 })
-        val monitor = ConnectionRequestInitiatorMonitor(controller, clock) { it == appRole }
+        val monitor = ConnectionRequestInitiatorMonitor(controller, clock, elapsedMs = { clock.now }) { it == appRole }
         fun create(role: MediaRole = appRole): ConnectionRequestCreateAttempt {
             val attempt = controller.create(role)!!; queue.run(); monitor.changed(); return attempt
         }
@@ -72,6 +73,73 @@ class ConnectionRequestInitiatorMonitorTest {
         fun finish() { queue.run(); monitor.changed() }
         fun start(role: MediaRole = appRole) { create(role); foreground(role); finish() }
         fun poll() { clock.fire(); finish() }
+    }
+    @Test fun earlyResumeWaitsRemainingBackoffThenGets() {
+        val f = Fixture(); f.retry = 5; f.start(); f.clock.now = 1000
+        val stale = f.clock.active.single(); f.monitor.background(f.owner); stale.action()
+        f.foreground(); f.finish(); assertEquals(1, f.statuses)
+        assertEquals(4000L, f.clock.active.single().delay)
+        f.poll(); assertEquals(2, f.statuses)
+    }
+    @Test fun resumeAfterBackoffExpiryGetsImmediately() {
+        val f = Fixture(); f.retry = 5; f.start(); f.monitor.background(f.owner)
+        f.clock.now = 6000; f.foreground(); f.finish(); assertEquals(2, f.statuses)
+    }
+    @Test fun backgroundInFlightCompletionPreservesBackoffWithoutTimer() {
+        val f = Fixture(); f.retry = 5; f.create(); f.foreground(); f.monitor.background(f.owner)
+        f.finish(); assertTrue(f.clock.active.isEmpty()); f.clock.now = 1000
+        f.foreground(); f.finish(); assertEquals(1, f.statuses)
+        assertEquals(4000L, f.clock.active.single().delay)
+    }
+    @Test fun successClearsBackoffAndRestoresExactCadenceAndImmediateResume() {
+        val f = Fixture(); f.retry = 5; f.statusError = ConnectionRequestError.RATE_LIMITED; f.start()
+        f.retry = null; f.statusError = null; f.poll()
+        assertEquals(2000L, f.clock.active.single().delay)
+        f.monitor.background(f.owner); f.foreground(); f.finish(); assertEquals(3, f.statuses)
+    }
+    @Test fun zeroBackoffDoesNotSurvivePause() {
+        val f = Fixture(); f.retry = 0; f.start(); f.monitor.background(f.owner)
+        f.foreground(); f.finish(); assertEquals(2, f.statuses)
+    }
+    @Test fun errorsWithoutRetryDoNotBlockResume() {
+        for (error in listOf(ConnectionRequestError.NETWORK, ConnectionRequestError.SERVER)) {
+            val f = Fixture(); f.statusError = error; f.start(); f.monitor.background(f.owner)
+            f.foreground(); f.finish(); assertEquals(2, f.statuses)
+        }
+    }
+    @Test fun sameRoleReplacementDoesNotInheritBackoff() {
+        val f = Fixture(); f.retry = 10; f.start(); val old = f.clock.active.single()
+        f.retry = null; f.create(); f.finish(); old.action(); f.finish()
+        assertEquals(2, f.statuses); assertEquals(2000L, f.clock.active.single().delay)
+    }
+    @Test fun differentRoleReplacementDoesNotInheritBackoff() {
+        val f = Fixture(); f.retry = 10; f.start(); f.retry = null
+        f.create(MediaRole.RECEIVE); f.appRole = MediaRole.RECEIVE
+        f.foreground(MediaRole.RECEIVE); f.finish(); assertEquals(2, f.statuses)
+    }
+    @Test fun inactiveContextsDiscardBackoff() {
+        for (state in listOf(ConnectionRequestState.CONNECTED, ConnectionRequestState.EXPIRED,
+            ConnectionRequestState.CANCELED, ConnectionRequestState.FAILED)) {
+            val f = Fixture(); f.retry = 10; f.start(); f.state = state; f.poll()
+            assertTrue(f.clock.active.isEmpty()); f.controller.clear(); f.monitor.changed()
+            f.retry = null; f.create(); f.finish()
+            assertEquals(3, f.statuses)
+        }
+    }
+    @Test fun recipientAndNoContextCannotActivateOldBackoff() {
+        val f = Fixture(); f.retry = 10; f.start(); val stale = f.clock.active.single()
+        f.controller.clear(); f.monitor.changed()
+        f.controller.preview(token(16, 1), token(16, 2), MediaRole.SEND); f.monitor.changed()
+        stale.action(); f.finish(); assertEquals(1, f.statuses); assertTrue(f.clock.active.isEmpty())
+    }
+    @Test fun deadlineAdditionSaturatesWithoutEarlyResume() {
+        val f = Fixture(); f.clock.now = Long.MAX_VALUE - 10000; f.retry = 20; f.start()
+        assertEquals(10000L, f.clock.active.single().delay)
+        f.monitor.background(f.owner); f.clock.now += 1000; f.foreground(); f.finish()
+        assertEquals(1, f.statuses); assertEquals(9000L, f.clock.active.single().delay)
+    }
+    @Test fun productionBackoffClockUsesElapsedRealtime() {
+        assertTrue(source("ConnectionRequestInitiatorMonitor").contains("android.os.SystemClock.elapsedRealtime()"))
     }
     @Test fun noRequestForegroundDoesNotGet() { val f = Fixture(); f.foreground(); f.finish(); assertEquals(0, f.statuses); assertTrue(f.clock.active.isEmpty()) }
     @Test fun recipientContextNeverPolled() { val f = Fixture(); f.controller.preview(token(16, 1), token(16, 2), MediaRole.SEND); f.foreground(); f.finish(); assertEquals(0, f.statuses); assertTrue(f.clock.active.isEmpty()) }

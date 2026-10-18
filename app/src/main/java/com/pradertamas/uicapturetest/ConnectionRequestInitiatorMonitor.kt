@@ -23,6 +23,7 @@ internal fun interface ConnectionRequestPollScheduler {
 internal class ConnectionRequestInitiatorMonitor(
     private val controller: ConnectionRequestController,
     private val scheduler: ConnectionRequestPollScheduler,
+    private val elapsedMs: () -> Long = { android.os.SystemClock.elapsedRealtime() },
     private val roleAllowed: (MediaRole) -> Boolean = { true }
 ) {
     private val lock = Any()
@@ -30,6 +31,7 @@ internal class ConnectionRequestInitiatorMonitor(
     private var target: ConnectionRequestCreateAttempt? = null
     private var cancel: (() -> Unit)? = null
     private var timerEpoch = 0L
+    private var serverBackoffUntilElapsed = 0L
     private var immediate = false
     private var awaiting = false
     private var observedOperation: ConnectionRequestOperation? = null
@@ -46,15 +48,18 @@ internal class ConnectionRequestInitiatorMonitor(
     }
     private fun stop() {
         cancelFuture(); target = null; immediate = false; awaiting = false; observedOperation = null
+        serverBackoffUntilElapsed = 0L
     }
     private fun evaluate() {
         val snapshot = controller.initiatorMonitorSnapshot()
-        if (snapshot == null || !snapshot.active || !roleAllowed(snapshot.role) || !owners.containsValue(snapshot.role)) {
+        if (snapshot == null || !snapshot.active) {
             stop(); return
         }
         if (target !== snapshot.flow) {
             cancelFuture(); target = snapshot.flow; immediate = true; awaiting = false; observedOperation = null
+            serverBackoffUntilElapsed = 0L
         }
+        val eligible = roleAllowed(snapshot.role) && owners.containsValue(snapshot.role)
         if (snapshot.operation != null) {
             cancelFuture(); awaiting = true; observedOperation = snapshot.operation
             // An already running GET satisfies the immediate refresh; other mutations do not.
@@ -65,8 +70,21 @@ internal class ConnectionRequestInitiatorMonitor(
             awaiting = false
             val wasStatus = observedOperation == ConnectionRequestOperation.STATUS
             observedOperation = null
-            if (wasStatus) { schedule(nextDelay(snapshot.retryAfterSeconds)); return }
+            if (wasStatus) {
+                val retry = retryMillis(snapshot.retryAfterSeconds)
+                val now = elapsedMs()
+                serverBackoffUntilElapsed = if (retry == 0L) 0L else
+                    if (now > Long.MAX_VALUE - retry) Long.MAX_VALUE else now + retry
+                if (eligible) { schedule(maxOf(2000L, backoffRemaining())); return }
+            }
             immediate = true
+        }
+        if (!eligible) {
+            cancelFuture(); immediate = true; return
+        }
+        if (immediate && backoffRemaining() > 0) {
+            if (cancel == null) schedule(backoffRemaining())
+            return
         }
         if (immediate) {
             immediate = false; cancelFuture()
@@ -77,7 +95,7 @@ internal class ConnectionRequestInitiatorMonitor(
                 // A concurrent context/operation won admission. Its state event will re-evaluate.
                 target = null
             }
-        } else if (cancel == null) schedule(nextDelay(snapshot.retryAfterSeconds))
+        } else if (cancel == null) schedule(maxOf(2000L, backoffRemaining()))
     }
     private fun schedule(delayMillis: Long) {
         if (cancel != null) return
@@ -89,10 +107,12 @@ internal class ConnectionRequestInitiatorMonitor(
             }
         }
     }
-    private fun nextDelay(seconds: Long?): Long {
-        val retry = seconds?.takeIf { it > 0 }?.let { if (it > Long.MAX_VALUE / 1000) Long.MAX_VALUE else it * 1000 } ?: 0
-        return maxOf(2000, retry)
-    }
+    private fun backoffRemaining(): Long =
+        (serverBackoffUntilElapsed - elapsedMs()).coerceAtLeast(0L)
+
+    private fun retryMillis(seconds: Long?): Long = seconds?.takeIf { it > 0 }?.let {
+        if (it > Long.MAX_VALUE / 1000) Long.MAX_VALUE else it * 1000
+    } ?: 0L
 }
 
 internal object ConnectionRequestInitiatorMonitoring {
