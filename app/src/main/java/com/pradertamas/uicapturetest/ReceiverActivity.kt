@@ -28,12 +28,15 @@ import org.webrtc.SurfaceViewRenderer
 /** Foreground-only native receiver. Configuration recreation preserves the ViewModel/peer, replaces only the renderer. */
 class ReceiverActivity : ComponentActivity() {
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
+    private val requestSetupOwner = ConnectionRequestSetupOwner()
     override fun onResume() {
         super.onResume()
         ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.RECEIVE)
+        ConnectionRequestSetup.coordinator.foreground(requestSetupOwner, MediaRole.RECEIVE)
     }
     override fun onPause() {
         ConnectionRequestInitiatorMonitoring.monitor.background(requestMonitorOwner)
+        ConnectionRequestSetup.coordinator.background(requestSetupOwner)
         super.onPause()
     }
     private lateinit var model: ReceiverViewModel

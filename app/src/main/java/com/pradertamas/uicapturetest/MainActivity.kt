@@ -39,6 +39,7 @@ import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
+    private val requestSetupOwner = ConnectionRequestSetupOwner()
     private var externalUi = false
     private val remoteSharing: Boolean get() = PairingHost.controller.sharedWaitingProtected
     private var consentEpoch = -1L
@@ -52,11 +53,13 @@ class MainActivity : ComponentActivity() {
     }
     override fun onPause() {
         ConnectionRequestInitiatorMonitoring.monitor.background(requestMonitorOwner)
+        ConnectionRequestSetup.coordinator.background(requestSetupOwner)
         traceActivity("activity-onPause"); super.onPause()
     }
     override fun onResume() {
         super.onResume()
         ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.SEND)
+        ConnectionRequestSetup.coordinator.foreground(requestSetupOwner, MediaRole.SEND)
         traceActivity("activity-onResume")
     }
     override fun onStart() {

@@ -23,7 +23,8 @@ internal class ConnectionRequestRecipientCoordinator(
     private val idle: () -> Boolean,
     private val arm: () -> Unit,
     private val stopIdle: () -> Boolean,
-    private val release: () -> Unit
+    private val release: () -> Unit,
+    private val beforeWithdraw: (ConnectionRequestRecipientFlow) -> Unit = {}
 ) {
     private val lock = Any()
     private var recipient: ConnectionRequestRecipientFlow? = null
@@ -81,6 +82,7 @@ internal class ConnectionRequestRecipientCoordinator(
             finishOwned(context); return@synchronized
         }
         if (access.won && snapshot.request?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) {
+            beforeWithdraw(flow)
             last = ConnectionRequestOperation.WITHDRAW; controller.withdraw(flow); onControllerState(controller.state.value)
         }
         // Unknown Accept result must first be retried with the SAME claim, never silently abandoned.
@@ -122,7 +124,8 @@ internal object ConnectionRequestRecipients {
     val coordinator by lazy {
         ConnectionRequestRecipientCoordinator(ConnectionRequests.controller, AppMediaRoles::pairingAllowed,
             ConnectionRequestRuntimeGate::armRequestFirst, AppMediaRoles::stopIdleLegacyForRequestFirst,
-            ConnectionRequestRuntimeGate::releaseRequestFirst).also { coordinator ->
+            ConnectionRequestRuntimeGate::releaseRequestFirst,
+            { ConnectionRequestSetup.coordinator.suspendRecipient(it) }).also { coordinator ->
             scope.launch { ConnectionRequests.controller.state.collect { coordinator.onControllerState(it) } }
         }
     }

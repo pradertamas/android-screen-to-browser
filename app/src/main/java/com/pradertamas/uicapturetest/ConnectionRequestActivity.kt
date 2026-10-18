@@ -18,6 +18,15 @@ import com.pradertamas.uicapturetest.ui.theme.UICaptureTestTheme
 class ConnectionRequestActivity : ComponentActivity() {
     private val coordinator get() = ConnectionRequestRecipients.coordinator
     private lateinit var model: ConnectionRequestActivityViewModel
+    private val setupOwner = ConnectionRequestSetupOwner()
+    override fun onResume() {
+        super.onResume()
+        model.flow?.let { ConnectionRequestSetup.coordinator.foreground(setupOwner, it) }
+    }
+    override fun onPause() {
+        ConnectionRequestSetup.coordinator.background(setupOwner)
+        super.onPause()
+    }
     private var entryError by mutableStateOf<RecipientEntryError?>(null)
     private fun incoming(value: Intent) {
         check(Looper.myLooper() == Looper.getMainLooper())

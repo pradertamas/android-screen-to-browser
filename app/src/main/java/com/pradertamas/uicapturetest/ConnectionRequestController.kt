@@ -16,6 +16,16 @@ internal data class ConnectionRequestRecipientAccess(val won: Boolean, val accep
 /** Credential-free internal scheduling projection. Attempt is opaque local context identity. */
 internal class InitiatorMonitorSnapshot(val flow: ConnectionRequestCreateAttempt, val role: MediaRole,
     val active: Boolean, val operation: ConnectionRequestOperation?, val retryAfterSeconds: Long?)
+internal class ConnectionRequestSetupSnapshot(
+    val flow: Any, val side: ConnectionRequestSide, val initiatorRole: MediaRole,
+    val state: ConnectionRequestState?, val won: Boolean, val operation: ConnectionRequestOperation?,
+    val initiatorReady: Boolean?, val recipientReady: Boolean?, val assignment: Boolean,
+    val completion: Long, val completedOperation: ConnectionRequestOperation?,
+    val error: ConnectionRequestError?, val retryAfterSeconds: Long?,
+    val completions: List<ConnectionRequestSetupCompletion>
+)
+internal class ConnectionRequestSetupCompletion(val revision: Long, val operation: ConnectionRequestOperation,
+    val error: ConnectionRequestError?, val retryAfterSeconds: Long?, val elapsedMs: Long)
 
 /** Blocking HTTP lives on a serial worker; all context/publication changes share one lock.
  * No Activity, storage, polling, media-role mutation or automatic session start. */
@@ -30,7 +40,13 @@ class ConnectionRequestController(
         val initiatorSecret: ConnectionCredential? = null, var claim: ConnectionCredential? = null,
         var won: Boolean = false, val expiryElapsedMs: Long? = null,
         val originAttempt: ConnectionRequestCreateAttempt? = null,
-        val recipientFlow: ConnectionRequestRecipientFlow? = null)
+        val recipientFlow: ConnectionRequestRecipientFlow? = null) {
+        var completion = 0L
+        var completedOperation: ConnectionRequestOperation? = null
+        var completionError: ConnectionRequestError? = null
+        var completionRetry: Long? = null
+        val setupCompletions = mutableMapOf<ConnectionRequestOperation, ConnectionRequestSetupCompletion>()
+    }
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
@@ -159,6 +175,45 @@ class ConnectionRequestController(
         ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
     fun refreshStatus() = refreshStatusFor(null)
+    internal fun setupSnapshot(): ConnectionRequestSetupSnapshot? = synchronized(lock) {
+        val c = context ?: return@synchronized null
+        val flow = c.originAttempt ?: c.recipientFlow ?: return@synchronized null
+        ConnectionRequestSetupSnapshot(flow, c.side, c.role, c.metadata?.state, c.won, activeOperation,
+            c.metadata?.initiatorReady, c.metadata?.recipientReady, c.metadata?.assignment != null,
+            c.completion, c.completedOperation, c.completionError, c.completionRetry, c.setupCompletions.values.sortedBy { it.revision })
+    }
+    /** Main-thread synchronous role policy only; never dispatch/wait or HTTP under this lock. */
+    internal fun prepareRecipientSetupRole(flow: ConnectionRequestRecipientFlow, action: () -> Boolean): Boolean = synchronized(lock) {
+        val c = context
+        if (c?.recipientFlow !== flow || !c.won || c.metadata?.state != ConnectionRequestState.ACCEPTED) false else action()
+    }
+    /** Exact local flow admission and operation reservation share the authority lock. */
+    internal fun setInitiatorReady(flow: ConnectionRequestCreateAttempt): Boolean = setupOperation(flow, ConnectionRequestOperation.READINESS)
+    internal fun setRecipientReady(flow: ConnectionRequestRecipientFlow): Boolean = setupOperation(flow, ConnectionRequestOperation.READINESS)
+    internal fun refreshRecipientSetupStatus(flow: ConnectionRequestRecipientFlow): Boolean = setupOperation(flow, ConnectionRequestOperation.STATUS)
+    internal fun createInitiatorSession(flow: ConnectionRequestCreateAttempt, freshStatus: Long): Boolean =
+        setupOperation(flow, ConnectionRequestOperation.SESSION, freshStatus)
+    private fun setupOperation(flow: Any, op: ConnectionRequestOperation, freshStatus: Long? = null): Boolean = synchronized(lock) {
+        val c = context ?: return@synchronized false
+        val initiator = c.side == ConnectionRequestSide.INITIATOR
+        if ((if (initiator) c.originAttempt else c.recipientFlow) !== flow || activeOperation != null ||
+            (!initiator && (!c.won || c.claim == null))) return@synchronized false
+        val state = c.metadata?.state
+        if (op == ConnectionRequestOperation.SESSION) {
+            if (!initiator || state !in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING) ||
+                freshStatus != c.completion || c.completedOperation != ConnectionRequestOperation.STATUS || c.completionError != null ||
+                (state == ConnectionRequestState.ACCEPTED && (c.metadata?.initiatorReady != true || c.metadata?.recipientReady != true))) return@synchronized false
+        } else if (state != ConnectionRequestState.ACCEPTED) return@synchronized false
+        operation(op, { true }) {
+            when (op) {
+                ConnectionRequestOperation.READINESS -> api.ready(it.id, auth(it), true,
+                    if (initiator) ConnectionRequestAuthScope.INITIATOR else ConnectionRequestAuthScope.CLAIM)
+                ConnectionRequestOperation.SESSION -> api.session(it.id, checkNotNull(it.initiatorSecret))
+                else -> api.status(it.id, checkNotNull(it.claim), ConnectionRequestAuthScope.CLAIM)
+            }
+        }
+        true
+    }
     internal fun initiatorMonitorSnapshot(): InitiatorMonitorSnapshot? = synchronized(lock) {
         val c = context ?: return@synchronized null
         if (c.side != ConnectionRequestSide.INITIATOR) return@synchronized null
@@ -231,8 +286,18 @@ class ConnectionRequestController(
             synchronized(lock) {
                 if (generation != token || context !== c) return@synchronized
                 activeOperation = null
+                c.completion++
+                c.completedOperation = op
+                c.completionError = result.error
+                c.completionRetry = result.retryAfterSeconds
+                fun rememberCompletion() {
+                    if (op in setOf(ConnectionRequestOperation.STATUS, ConnectionRequestOperation.READINESS, ConnectionRequestOperation.SESSION))
+                        c.setupCompletions[op] = ConnectionRequestSetupCompletion(c.completion, op, c.completionError, result.retryAfterSeconds, elapsedMs())
+                }
                 val update = result.metadata
                 if (update != null && !validUpdate(c, update, op)) {
+                    c.completionError = ConnectionRequestError.INVALID_RESPONSE
+                    rememberCompletion()
                     publish(c, error = ConnectionRequestError.INVALID_RESPONSE); return@synchronized
                 }
                 if (update != null) {
@@ -245,6 +310,7 @@ class ConnectionRequestController(
                     if (op == ConnectionRequestOperation.ACCEPT && result.httpStatus == 200 &&
                         update.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) c.won = true
                 }
+                rememberCompletion()
                 publish(c, error = result.error)
                 mutable.value = mutable.value.copy(retryAfterSeconds = result.retryAfterSeconds)
             }
