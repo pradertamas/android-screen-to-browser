@@ -5,6 +5,7 @@ import android.app.Activity
 import androidx.activity.enableEdgeToEdge
 import android.content.Intent
 import android.view.WindowManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
@@ -114,6 +115,8 @@ class ReceiverActivity : ComponentActivity() {
                                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
                                     .padding(24.dp).verticalScroll(taskScroll), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                     val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
+                                    val closeTask: () -> Unit = { code = ""; error = ""; selectedPath = null }
+                                    BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)
                                     if (activePath == null) {
                                     Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                                     Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
@@ -135,7 +138,7 @@ class ReceiverActivity : ComponentActivity() {
                                     }
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     }
-                                    if (activePath != null) WorkflowPanel(activePath, canChoose, { code = ""; error = ""; selectedPath = null }) {
+                                    if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {
                                         if (phase == ReceiverPhase.PAIRING) {
                                             if (activePath == ConnectionWorkflow.SHOW && ShowConnection.receiverReady(ui.home)) {
                                                 WorkflowOwnCode(ui.home.code)

@@ -68,7 +68,7 @@ class ConnectionWorkflowTest {
             assertTrue(task.contains("WorkflowOwnCode(")); assertTrue(task.contains("Scan QR code"))
             assertTrue(task.contains("Connection code")); assertTrue(task.contains("Text(\"Connect\")"))
             assertTrue(task.indexOf("Scan QR code") < task.indexOf("OutlinedTextField"))
-            assertTrue(task.contains("selectedPath = null"))
+            assertTrue(activity.contains("WorkflowPanel(activePath, canChoose, closeTask)"))
             assertTrue(activity.contains("remember(activePath) { androidx.compose.foundation.ScrollState(0) }"))
             assertTrue(activity.contains("verticalScroll(taskScroll)"))
         }
@@ -125,5 +125,28 @@ class ConnectionWorkflowTest {
         val section = text("AppPairingSection.kt")
         assertTrue(section.contains("model.accept(allowed)")); assertFalse(section.contains("startForegroundService("))
         assertFalse(section.contains("switchRole(")); assertFalse(section.contains("model.join("))
+    }
+    @Test fun systemBackAndVisibleBackShareOnlyTheEnabledTaskCallback() {
+        for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
+            val activity = text(name)
+            assertTrue(activity.contains("import androidx.activity.compose.BackHandler"))
+            assertTrue(activity.contains("BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)"))
+            assertTrue(activity.contains("WorkflowPanel(activePath, canChoose, closeTask)"))
+            val callback = activity.substringAfter("val closeTask: () -> Unit = {").substringBefore("}")
+            assertTrue(callback.contains("selectedPath = null"))
+            for (forbidden in listOf("switchRole", "returnToSend", "finish(", "create(", "join(", "ensureOwnCreate", "regenerate"))
+                assertFalse(callback.contains(forbidden))
+            assertTrue(activity.substringBefore("val closeTask").contains("&& !scanning"))
+            assertTrue(activity.indexOf("val closeTask") < activity.indexOf("BackHandler(enabled"))
+        }
+        val main = text("MainActivity.kt")
+        assertTrue(main.contains("val closeTask: () -> Unit = { PairingHost.controller.typed(\"\"); joinCode = \"\"; selectedPath = null }"))
+        val receiver = text("ReceiverActivity.kt")
+        assertTrue(receiver.contains("override fun handleOnBackPressed() { returnToSend(stopActive = true) }"))
+        assertTrue(receiver.contains("if (phase != ReceiverPhase.RECEIVING)"))
+        assertTrue(receiver.indexOf("onBackPressedDispatcher.addCallback") < receiver.indexOf("BackHandler(enabled"))
+        for (path in listOf(ConnectionWorkflow.CONNECT, ConnectionWorkflow.SHOW)) {
+            assertNotNull(ConnectionWorkflow.title(path)) // Both paths use the same activePath gate.
+        }
     }
 }

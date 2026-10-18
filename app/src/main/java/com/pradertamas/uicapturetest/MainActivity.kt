@@ -11,6 +11,7 @@ import android.os.Bundle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.Lifecycle
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -145,6 +146,8 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(taskScroll),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
+                        val closeTask: () -> Unit = { PairingHost.controller.typed(""); joinCode = ""; selectedPath = null }
+                        BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)
                         if (activePath == null) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                         Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
@@ -177,9 +180,7 @@ class MainActivity : ComponentActivity() {
                         }
                         if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
                         }
-                        if (activePath != null) WorkflowPanel(activePath, canChoose, {
-                            PairingHost.controller.typed(""); joinCode = ""; selectedPath = null
-                        }) {
+                        if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {
                             if (activePath == ConnectionWorkflow.SHOW && ShowConnection.senderReady(home) && !rtc.busy) {
                                 WorkflowOwnCode(home.code)
                             }
