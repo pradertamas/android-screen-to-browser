@@ -261,6 +261,24 @@ class ConnectionRequestShareTest {
         assertEquals(1, opens); assertEquals(1, f.creates)
         assertEquals(ReceiverPhase.ENDED, engine.home.phase)
     }
+    @Test fun customApiCannotBypassInvalidTtlContextValidation() {
+        for (ttl in listOf(0L, -1L)) {
+            val f = Fixture(); f.ttlMs = ttl
+            val attempt = f.controller.create(MediaRole.SEND)!!; f.queue.run()
+            assertEquals(ConnectionRequestError.INVALID_RESPONSE, f.controller.state.value.error)
+            assertNull(f.controller.state.value.request); assertNull(f.controller.state.value.operation)
+            assertNull(f.controller.shareableInitiatorData(MediaRole.SEND, attempt))
+            f.start(); f.finish()
+            assertNull(f.ui.delivery); assertFalse(f.ui.busy); assertTrue(f.gate.legacyStartAllowed())
+        }
+    }
+    @Test fun customApiDeadlineOverflowFailsBeforePublishingContext() {
+        val f = Fixture(); f.elapsed = Long.MAX_VALUE - 1
+        f.start(); f.finish()
+        assertEquals(ConnectionRequestError.INVALID_RESPONSE, f.controller.state.value.error)
+        assertNull(f.controller.state.value.request); assertNull(f.ui.delivery)
+        assertFalse(f.ui.busy); assertTrue(f.gate.legacyStartAllowed())
+    }
     @Test fun productionClockIncludesDeepSleepAndDoesNotUseUptime() {
         val text = source("ConnectionRequestController")
         assertTrue(text.contains("android.os.SystemClock::elapsedRealtime"))

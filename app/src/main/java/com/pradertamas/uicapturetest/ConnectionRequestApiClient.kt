@@ -10,6 +10,14 @@ import java.io.IOException
 import java.time.Instant
 import java.util.concurrent.TimeUnit
 
+/** Server-domain validation shared with the controller's fake/custom API boundary.
+ * Throws only into safe INVALID_RESPONSE handling; never substitutes a client TTL. */
+internal fun connectionRequestCreateTtlMillis(metadata: ConnectionRequestMetadata): Long {
+    val expiry = requireNotNull(metadata.expiresAt)
+    require(expiry.isAfter(metadata.serverNow))
+    return java.time.Duration.between(metadata.serverNow, expiry).toMillis().also { require(it > 0) }
+}
+
 interface ConnectionRequestApi {
     fun create(role: MediaRole): ConnectionRequestResult
     fun status(id: String, auth: ConnectionCredential, scope: ConnectionRequestAuthScope = ConnectionRequestAuthScope.INITIATOR): ConnectionRequestResult
@@ -142,7 +150,10 @@ class ConnectionRequestApiClient(private val transport: ConnectionRequestTranspo
                 if (metadata.createdAt != null) require(!metadata.expiresAt!!.isBefore(metadata.createdAt))
             }
             if (wire.code != 410) when (action) {
-                "create" -> require(state == ConnectionRequestState.WAITING && metadata.expiresAt != null)
+                "create" -> {
+                    require(state == ConnectionRequestState.WAITING)
+                    connectionRequestCreateTtlMillis(metadata)
+                }
                 "status" -> require(initiator != null && metadata.expiresAt != null)
                 "accept" -> require(state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING) && metadata.acceptedAt != null && metadata.connectBy != null)
                 "cancel" -> require(state == ConnectionRequestState.CANCELED)

@@ -54,7 +54,8 @@ class ConnectionRequestTest {
                 ConnectionRequestWireResponse(result.code, json.toString(), result.retryAfterSeconds)
             } else result
         })
-        val controller = ConnectionRequestController(api, queue, elapsedMs = { 0 })
+        var elapsed = 0L
+        val controller = ConnectionRequestController(api, queue, elapsedMs = { elapsed })
         fun create(role: MediaRole = MediaRole.SEND) { controller.create(role); queue.run() }
         fun response(state: String, code: Int = 200, role: String = "send", modify: (JSONObject) -> Unit = {}) {
             respond = { _, _ -> ConnectionRequestWireResponse(code, body(state, role).also(modify).toString()) }
@@ -139,6 +140,80 @@ class ConnectionRequestTest {
     @Test fun staleStatusIgnored() { val f = Fixture(); f.create(); f.respond = { _, _ -> f.controller.clear(); ConnectionRequestWireResponse(200, body("ACCEPTED").toString()) }; f.controller.refreshStatus(); f.queue.run(); assertTrue(f.ui.idle); assertNull(f.ui.request) }
     @Test fun credentialsAbsentFromPublicStateAndStrings() { val f = Fixture(); f.accept(); val claim = JSONObject(f.inputs.last()!!).getString("claimSecret"); for (value in listOf(claim, initiator, capability)) assertFalse(f.ui.toString().contains(value)); assertFalse(ConnectionCredential(initiator).toString().contains(initiator)) }
     @Test fun previewStatusUsesCapabilityThenClaimAfterAccept() { val f = Fixture(); f.preview(); f.controller.refreshStatus(); f.queue.run(); assertEquals(capability, f.auths.last()); f.response("ACCEPTED"); f.controller.accept(); f.queue.run(); val claim = JSONObject(f.inputs.last()!!).getString("claimSecret"); f.controller.refreshStatus(); f.queue.run(); assertEquals(claim, f.auths.last()) }
+    private fun invalidCreateExpiry(mutate: (JSONObject) -> Unit, elapsed: Long = 0, parserRejects: Boolean = true) {
+        val f = Fixture(); f.elapsed = elapsed
+        f.respond = { _, _ -> ConnectionRequestWireResponse(201, created().also(mutate).toString()) }
+        if (parserRejects) {
+            val parsed = f.api.create(MediaRole.SEND)
+            assertEquals(ConnectionRequestError.INVALID_RESPONSE, parsed.error); assertNull(parsed.created)
+        }
+        val attempt = f.controller.create(MediaRole.SEND)!!; f.queue.run()
+        assertNull(f.ui.request); assertNull(f.ui.side); assertNull(f.ui.operation)
+        assertEquals(ConnectionRequestError.INVALID_RESPONSE, f.ui.error)
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND, attempt))
+        val gate = LegacyConnectionStartGate()
+        val coordinator = ConnectionRequestShareCoordinator(f.controller, gate::armRequestFirst,
+            gate::releaseRequestFirst, gate::legacyStartAllowed)
+        coordinator.start(ConnectionRequestShareOwner(), MediaRole.SEND) {}
+        f.queue.run(); coordinator.onRequestState(f.ui)
+        assertNull(coordinator.state.value.delivery); assertFalse(coordinator.state.value.busy)
+        assertEquals(RequestShareError.CREATE_FAILED, coordinator.state.value.error)
+        assertTrue(gate.legacyStartAllowed()); assertNull(f.ui.request)
+        assertEquals(ConnectionRequestError.INVALID_RESPONSE, f.ui.error)
+    }
+    @Test fun createRejectsZeroTtlWithoutContextOrChooser() = invalidCreateExpiry({ it.put("expiresAt", "2026-01-01T00:00:00Z") })
+    @Test fun createRejectsNegativeTtlWithoutContextOrChooser() = invalidCreateExpiry({ it.put("expiresAt", "2025-12-31T23:59:59Z") })
+    @Test fun createRejectsDurationMillisOverflow() = invalidCreateExpiry({
+        it.put("serverNow", java.time.Instant.MIN.toString()).put("expiresAt", java.time.Instant.MAX.toString())
+    })
+    @Test fun createRejectsLocalDeadlineOverflow() = invalidCreateExpiry({}, Long.MAX_VALUE - 1, parserRejects = false)
+    @Test fun createRejectsMalformedServerNow() = invalidCreateExpiry({ it.put("serverNow", "invalid") })
+    @Test fun createRejectsMissingServerNow() = invalidCreateExpiry({ it.remove("serverNow") })
+    @Test fun createRejectsMalformedExpiry() = invalidCreateExpiry({ it.put("expiresAt", "invalid") })
+    @Test fun createRejectsMissingExpiry() = invalidCreateExpiry({ it.remove("expiresAt") })
+    @Test fun createRejectsSubMillisecondUnrepresentableTtl() = invalidCreateExpiry({ it.put("expiresAt", "2026-01-01T00:00:00.000000001Z") })
+    @Test fun createRejectsWrongTypeTimes() {
+        for (key in listOf("serverNow", "expiresAt")) invalidCreateExpiry({ it.put(key, 123) })
+    }
+    @Test fun validSmallPositiveTtlAndNormalTtlKeepContextAttemptAndChooser() {
+        for (expiry in listOf("2026-01-01T00:00:00.001Z", "2026-01-01T00:05:00Z")) {
+            val f = Fixture(); f.respond = { _, _ -> ConnectionRequestWireResponse(201, created().put("expiresAt", expiry).toString()) }
+            val attempt = f.controller.create(MediaRole.SEND)!!; f.queue.run()
+            assertNull(f.ui.error); assertEquals(ConnectionRequestState.WAITING, f.ui.request?.state)
+            assertNotNull(f.controller.shareableInitiatorData(MediaRole.SEND, attempt))
+            val gate = LegacyConnectionStartGate()
+            val coordinator = ConnectionRequestShareCoordinator(f.controller, gate::armRequestFirst,
+                gate::releaseRequestFirst, gate::legacyStartAllowed)
+            val owner = ConnectionRequestShareOwner(); coordinator.start(owner, MediaRole.SEND) {}
+            val delivery = coordinator.state.value.delivery!!
+            assertNotNull(coordinator.takeLink(owner, delivery, MediaRole.SEND)); assertFalse(gate.legacyStartAllowed())
+        }
+    }
+    @Test fun staleInvalidTtlResponseCannotOverwriteOrReleaseNewAttempt() {
+        for (bad in listOf("2026-01-01T00:00:00Z", java.time.Instant.MAX.toString())) {
+            val f = Fixture(); var first = true
+            f.respond = { _, _ ->
+                if (first) {
+                    first = false
+                    f.controller.create(MediaRole.SEND); f.queue.run() // B completes while A is in transport.
+                    val json = created().put("expiresAt", bad)
+                    if (bad == java.time.Instant.MAX.toString()) json.put("serverNow", java.time.Instant.MIN.toString())
+                    ConnectionRequestWireResponse(201, json.toString())
+                } else ConnectionRequestWireResponse(201, created(requestId = token(16, 8)).toString())
+            }
+            val gate = LegacyConnectionStartGate()
+            val coordinator = ConnectionRequestShareCoordinator(f.controller, gate::armRequestFirst,
+                gate::releaseRequestFirst, gate::legacyStartAllowed)
+            val owner = ConnectionRequestShareOwner(); coordinator.start(owner, MediaRole.SEND) {}
+            f.queue.run(); coordinator.onRequestState(f.ui)
+            assertEquals(token(16, 8), f.ui.request?.requestId); assertNull(f.ui.error); assertNull(f.ui.operation)
+            assertFalse(gate.legacyStartAllowed()); assertFalse(coordinator.state.value.busy)
+            assertNull(coordinator.state.value.delivery)
+            coordinator.start(owner, MediaRole.SEND) {}
+            assertNotNull(coordinator.state.value.delivery)
+        }
+    }
     @Test fun invalidResponseStatesDatesAssignment() {
         for (mutate in listOf<(JSONObject) -> Unit>({ it.put("state", "FUTURE") }, { it.put("expiresAt", "bad") },
             { it.put("requestId", "bad") }, { it.put("session", JSONObject().put("code", "bad").put("role", "sender").put("intent", "create")) })) {

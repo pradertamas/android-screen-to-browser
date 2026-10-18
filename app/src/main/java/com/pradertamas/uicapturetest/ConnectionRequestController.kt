@@ -81,12 +81,16 @@ class ConnectionRequestController(
                     if (created != null && result.error == null && created.metadata.initiatorRole == role) {
                         // Create guarantees serverNow = creation time, expiresAt = creation + TTL.
                         // Anchor BEFORE HTTP/cancel latency; never extend validity on status refresh.
-                        val ttl = runCatching { java.time.Duration.between(created.metadata.serverNow,
-                            created.metadata.expiresAt).toMillis() }.getOrNull()
-                        val deadline = ttl?.takeIf { it > 0 }?.let { runCatching { Math.addExact(started, it) }.getOrNull() }
-                        context = Context(ConnectionRequestSide.INITIATOR, created.metadata, created.metadata.requestId,
-                            role, created.capability, created.initiatorSecret, expiryElapsedMs = deadline, originAttempt = attempt)
-                        publish(context, error = cancellation?.error)
+                        val deadline = runCatching {
+                            Math.addExact(started, connectionRequestCreateTtlMillis(created.metadata))
+                        }.getOrNull()
+                        if (deadline == null) {
+                            publish(null, error = ConnectionRequestError.INVALID_RESPONSE)
+                        } else {
+                            context = Context(ConnectionRequestSide.INITIATOR, created.metadata, created.metadata.requestId,
+                                role, created.capability, created.initiatorSecret, expiryElapsedMs = deadline, originAttempt = attempt)
+                            publish(context, error = cancellation?.error)
+                        }
                     } else publish(null, error = result.error ?: ConnectionRequestError.INVALID_RESPONSE)
                 }
             }

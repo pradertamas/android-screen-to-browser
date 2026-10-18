@@ -52,6 +52,16 @@ time, no client TTL constant is introduced, and status updates do not extend thi
 deadline. At or after the deadline, WAITING is not reusable and an explicit Share
 may create a replacement. The production clock is injectable for deterministic tests.
 
+Create expiry metadata is strict: required String timestamps must parse, expiry
+must be later than serverNow, and the positive TTL must be representable in
+milliseconds (including rejection of positive sub-millisecond durations). Zero,
+negative or overflowing TTL is INVALID_RESPONSE in the parser. The controller
+reuses that validation for custom API implementations and checks deadline addition
+with Math.addExact before constructing any context. Deadline overflow is also
+INVALID_RESPONSE: no context, no share data and no chooser. Matching failures
+release the gate only through the existing atomic empty-current-attempt policy;
+stale invalid responses cannot overwrite or release a newer attempt.
+
 A different-role WAITING request follows existing best-effort
 cancel/replacement policy. ACCEPTED/CONNECTING/CONNECTED refuse Share locally.
 
