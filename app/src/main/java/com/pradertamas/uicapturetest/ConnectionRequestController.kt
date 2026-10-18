@@ -13,6 +13,9 @@ internal class ConnectionRequestRecipientFlow {
     override fun toString() = "ConnectionRequestRecipientFlow[redacted]"
 }
 internal data class ConnectionRequestRecipientAccess(val won: Boolean, val acceptAttempted: Boolean)
+/** Credential-free internal scheduling projection. Attempt is opaque local context identity. */
+internal class InitiatorMonitorSnapshot(val flow: ConnectionRequestCreateAttempt, val role: MediaRole,
+    val active: Boolean, val operation: ConnectionRequestOperation?, val retryAfterSeconds: Long?)
 
 /** Blocking HTTP lives on a serial worker; all context/publication changes share one lock.
  * No Activity, storage, polling, media-role mutation or automatic session start. */
@@ -156,6 +159,23 @@ class ConnectionRequestController(
         ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
     fun refreshStatus() = refreshStatusFor(null)
+    internal fun initiatorMonitorSnapshot(): InitiatorMonitorSnapshot? = synchronized(lock) {
+        val c = context ?: return@synchronized null
+        if (c.side != ConnectionRequestSide.INITIATOR) return@synchronized null
+        val flow = c.originAttempt ?: return@synchronized null
+        InitiatorMonitorSnapshot(flow, c.role, c.metadata?.state?.activeSetup == true, activeOperation, mutable.value.retryAfterSeconds)
+    }
+    /** Matching side/role/flow and operation admission are one authority boundary. */
+    internal fun refreshInitiatorStatus(expectedRole: MediaRole, expectedFlow: ConnectionRequestCreateAttempt? = null): Boolean = synchronized(lock) {
+        val c = context ?: return@synchronized false
+        if (c.side != ConnectionRequestSide.INITIATOR || c.role != expectedRole ||
+            (expectedFlow != null && c.originAttempt !== expectedFlow) || c.metadata?.state?.activeSetup != true ||
+            activeOperation != null) return@synchronized false
+        operation(ConnectionRequestOperation.STATUS, { true }) {
+            api.status(it.id, checkNotNull(it.initiatorSecret), ConnectionRequestAuthScope.INITIATOR)
+        }
+        true
+    }
     internal fun refreshStatus(flow: ConnectionRequestRecipientFlow) = refreshStatusFor(flow)
     private fun refreshStatusFor(flow: ConnectionRequestRecipientFlow?) = operation(ConnectionRequestOperation.STATUS, { true }, expectedFlow = flow) {
         api.status(it.id, auth(it), if (it.side == ConnectionRequestSide.INITIATOR) ConnectionRequestAuthScope.INITIATOR

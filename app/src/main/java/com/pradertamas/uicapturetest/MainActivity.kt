@@ -38,6 +38,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
+    private val requestMonitorOwner = ConnectionRequestForegroundOwner()
     private var externalUi = false
     private val remoteSharing: Boolean get() = PairingHost.controller.sharedWaitingProtected
     private var consentEpoch = -1L
@@ -49,9 +50,13 @@ class MainActivity : ComponentActivity() {
         val home = PairingHost.state.value
         ScreenShareLifecycleDiag.write("event=$event lifecycle=${lifecycle.currentState} phase=${home.phase} epoch=${home.epoch} externalUi=$externalUi remoteSharing=$remoteSharing role=${AppMediaRoles.role} captureBusy=${CaptureState.state.value.busy}" + (willCallHide?.let { " willCallHide=$it" } ?: ""))
     }
-    override fun onPause() { traceActivity("activity-onPause"); super.onPause() }
+    override fun onPause() {
+        ConnectionRequestInitiatorMonitoring.monitor.background(requestMonitorOwner)
+        traceActivity("activity-onPause"); super.onPause()
+    }
     override fun onResume() {
         super.onResume()
+        ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.SEND)
         traceActivity("activity-onResume")
     }
     override fun onStart() {
