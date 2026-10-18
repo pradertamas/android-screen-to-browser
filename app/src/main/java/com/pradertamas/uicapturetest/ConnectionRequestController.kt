@@ -42,6 +42,8 @@ class ConnectionRequestController(
         val originAttempt: ConnectionRequestCreateAttempt? = null,
         val recipientFlow: ConnectionRequestRecipientFlow? = null) {
         var completion = 0L
+        var mediaOwner: RequestMediaOwner? = null
+        var exitRequested = false
         var completedOperation: ConnectionRequestOperation? = null
         var completionError: ConnectionRequestError? = null
         var completionRetry: Long? = null
@@ -88,7 +90,8 @@ class ConnectionRequestController(
      * but never restores the old local context. The old server request may await expiry. */
     internal fun create(role: MediaRole): ConnectionRequestCreateAttempt? = synchronized(lock) {
         val old = context
-        if (old?.metadata?.state == ConnectionRequestState.CONNECTED || old?.side == ConnectionRequestSide.RECIPIENT) {
+        if (old?.metadata?.state == ConnectionRequestState.CONNECTED || old?.side == ConnectionRequestSide.RECIPIENT ||
+            old?.mediaOwner?.phase == RequestMediaPhase.STARTED) {
             rejected(); return@synchronized null
         }
         val token = ++generation
@@ -182,7 +185,7 @@ class ConnectionRequestController(
         val c = context ?: return@synchronized null
         val initiator = c.side == ConnectionRequestSide.INITIATOR
         if ((if (initiator) c.originAttempt else c.recipientFlow) !== flow ||
-            c.metadata?.state != ConnectionRequestState.CONNECTING || (!initiator && (!c.won || c.claim == null))) return@synchronized null
+            c.exitRequested || c.metadata?.state != ConnectionRequestState.CONNECTING || (!initiator && (!c.won || c.claim == null))) return@synchronized null
         val assignment = c.metadata?.assignment ?: return@synchronized null
         val role = if (initiator) c.role else if (c.role == MediaRole.SEND) MediaRole.RECEIVE else MediaRole.SEND
         if (assignment.role != role || assignment.intent != (if (initiator) PairingIntent.CREATE else PairingIntent.JOIN) ||
@@ -197,10 +200,77 @@ class ConnectionRequestController(
             c.metadata?.initiatorReady, c.metadata?.recipientReady, c.metadata?.assignment != null,
             c.completion, c.completedOperation, c.completionError, c.completionRetry, c.setupCompletions.values.sortedBy { it.revision })
     }
+    private fun matches(c: Context?, flow: Any) = c != null &&
+        (if (c.side == ConnectionRequestSide.INITIATOR) c.originAttempt else c.recipientFlow) === flow
+    /** Reservation contains no bearer export. A fresh bootstrap is obtained only at redemption. */
+    internal fun reserveMedia(flow: Any, role: MediaRole): RequestMediaOwner? = synchronized(lock) {
+        val c = context ?: return@synchronized null
+        val localRole = if (c.side == ConnectionRequestSide.INITIATOR) c.role else ConnectionRequestSetupCoordinator.opposite(c.role)
+        if (!matches(c, flow) || c.exitRequested || c.mediaOwner != null || activeOperation != null ||
+            c.metadata?.state != ConnectionRequestState.CONNECTING || c.metadata?.assignment?.role != role || localRole != role ||
+            (c.side == ConnectionRequestSide.RECIPIENT && !c.won)) return@synchronized null
+        RequestMediaOwner(flow, role).also { c.mediaOwner = it }
+    }
+    internal fun redeemMedia(owner: RequestMediaOwner): ProtectedSignalingBootstrap? = synchronized(lock) {
+        val c = context
+        if (!matches(c, owner.flow) || c?.mediaOwner !== owner || owner.phase != RequestMediaPhase.RESERVED) return@synchronized null
+        val bootstrap = protectedBootstrap(owner.flow) ?: return@synchronized null
+        owner.phase = RequestMediaPhase.STARTED
+        bootstrap
+    }
+    internal fun mediaDisposed(owner: RequestMediaOwner) = synchronized(lock) {
+        owner.phase = RequestMediaPhase.DISPOSED
+        // A failed/stopped media owner must never be automatically restarted for this flow.
+        if (matches(context, owner.flow) && context?.mediaOwner === owner) context?.exitRequested = true
+    }
+    internal fun mediaPhase(owner: RequestMediaOwner): RequestMediaPhase = synchronized(lock) { owner.phase }
+    internal fun mediaPhaseForFlow(flow: Any): RequestMediaPhase? = synchronized(lock) {
+        if (matches(context, flow)) context?.mediaOwner?.phase else null
+    }
+    /** Local teardown is performed by the media owner BEFORE this HTTP admission. No callbacks under lock. */
+    internal fun requestMediaExit(flow: Any): Boolean = synchronized(lock) {
+        val c = context ?: return@synchronized false
+        if (!matches(c, flow) || (c.side == ConnectionRequestSide.RECIPIENT && !c.won) ||
+            c.mediaOwner?.phase == RequestMediaPhase.STARTED) return@synchronized false
+        c.exitRequested = true
+        if (activeOperation != null) return@synchronized false
+        when (flow) {
+            is ConnectionRequestCreateAttempt -> cancelInitiator(flow)
+            is ConnectionRequestRecipientFlow -> {
+                if (!c.won || c.metadata?.state !in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) false
+                else { withdraw(flow); true }
+            }
+            else -> false
+        }
+    }
+    internal fun cancelInitiator(flow: ConnectionRequestCreateAttempt): Boolean = synchronized(lock) {
+        val c = context
+        if (!matches(c, flow) || c?.side != ConnectionRequestSide.INITIATOR || activeOperation != null ||
+            c.mediaOwner?.phase == RequestMediaPhase.STARTED || c.metadata?.state?.activeSetup != true) return@synchronized false
+        c.exitRequested = true
+        operation(ConnectionRequestOperation.CANCEL, { true }) { api.cancel(it.id, checkNotNull(it.initiatorSecret)) }
+        true
+    }
+    /** Explicit reconciliation after a conflict/lost exit response, including server CONNECTED. */
+    internal fun reconcileMediaExit(flow: Any): Boolean = synchronized(lock) {
+        val c = context
+        if (!matches(c, flow) || activeOperation != null || c?.exitRequested != true) return@synchronized false
+        operation(ConnectionRequestOperation.STATUS, { true }) {
+            api.status(it.id, auth(it), if (it.side == ConnectionRequestSide.INITIATOR)
+                ConnectionRequestAuthScope.INITIATOR else ConnectionRequestAuthScope.CLAIM)
+        }
+        true
+    }
+    internal fun clearDisposedMedia(flow: Any): Boolean = synchronized(lock) {
+        val c = context
+        if (!matches(c, flow) || c?.mediaOwner?.phase != RequestMediaPhase.DISPOSED ||
+            activeOperation != null || (c.metadata?.state?.terminal != true && c.metadata?.state != ConnectionRequestState.CONNECTED)) return@synchronized false
+        clear(); true // Gate release is deliberately left to B4E.
+    }
     /** Main-thread synchronous role policy only; never dispatch/wait or HTTP under this lock. */
     internal fun prepareRecipientSetupRole(flow: ConnectionRequestRecipientFlow, action: () -> Boolean): Boolean = synchronized(lock) {
         val c = context
-        if (c?.recipientFlow !== flow || !c.won || c.metadata?.state != ConnectionRequestState.ACCEPTED) false else action()
+        if (c?.recipientFlow !== flow || c.exitRequested || !c.won || c.metadata?.state != ConnectionRequestState.ACCEPTED) false else action()
     }
     /** Exact local flow admission and operation reservation share the authority lock. */
     internal fun setInitiatorReady(flow: ConnectionRequestCreateAttempt): Boolean = setupOperation(flow, ConnectionRequestOperation.READINESS)
@@ -211,7 +281,7 @@ class ConnectionRequestController(
     private fun setupOperation(flow: Any, op: ConnectionRequestOperation, freshStatus: Long? = null): Boolean = synchronized(lock) {
         val c = context ?: return@synchronized false
         val initiator = c.side == ConnectionRequestSide.INITIATOR
-        if ((if (initiator) c.originAttempt else c.recipientFlow) !== flow || activeOperation != null ||
+        if ((if (initiator) c.originAttempt else c.recipientFlow) !== flow || c.exitRequested || activeOperation != null ||
             (!initiator && (!c.won || c.claim == null))) return@synchronized false
         val state = c.metadata?.state
         if (op == ConnectionRequestOperation.SESSION) {

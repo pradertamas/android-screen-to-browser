@@ -1,6 +1,7 @@
 package com.pradertamas.uicapturetest
 
 enum class ReceiverPhase { PAIRING, CONNECTING, RECEIVING, ENDED, ERROR }
+internal enum class ReceiverMode { LEGACY, REQUEST_BOUND }
 data class ReceiverHome(val phase: ReceiverPhase = ReceiverPhase.ENDED, val code: String = "",
     val intent: PairingIntent = PairingIntent.CREATE, val status: String = "Ready to receive", val registered: Boolean = false)
 data class ReceiverIce(val mid: String?, val line: Int, val candidate: String)
@@ -32,6 +33,8 @@ class ReceiverEngine(private val wire: ReceiverWire,
     var home = ReceiverHome(); private set
     private var generation = 0L
     private var running = false
+    internal var mode = ReceiverMode.LEGACY; private set
+    private var requestDisposed: (() -> Unit)? = null
     private var socket: PairingLink? = null
     private var media: ReceiverMedia? = null
     private var registration: PairingRegistration? = null
@@ -43,8 +46,9 @@ class ReceiverEngine(private val wire: ReceiverWire,
     private var rotation: (() -> Unit)? = null
     private var grace: (() -> Unit)? = null
     private fun publish(value: ReceiverHome) { home = value; changed(value) }
-    fun create() = begin(generate(), PairingIntent.CREATE)
+    fun create() { if (mode == ReceiverMode.LEGACY) begin(generate(), PairingIntent.CREATE) }
     fun join(input: String): Boolean {
+        if (mode != ReceiverMode.LEGACY) return false
         val code = PairingCode.normalize(input) ?: return false
         if (home.phase !in setOf(ReceiverPhase.PAIRING, ReceiverPhase.ENDED, ReceiverPhase.ERROR)) return false
         begin(code, PairingIntent.JOIN); return true
@@ -53,6 +57,12 @@ class ReceiverEngine(private val wire: ReceiverWire,
         stop(); running = true; registration = PairingRegistration(code, intent, generate)
         publish(ReceiverHome(ReceiverPhase.PAIRING, code, intent, "Waiting for a sharing phone..."))
         open()
+    }
+    internal fun startRequest(intent: PairingIntent, disposed: () -> Unit) {
+        stop()
+        mode = ReceiverMode.REQUEST_BOUND; requestDisposed = disposed; running = true
+        publish(ReceiverHome(ReceiverPhase.PAIRING, "", intent, "Waiting for a sharing phone..."))
+        try { open() } catch (_: Exception) { end("Connection failed", true) }
     }
     private fun open() {
         val epoch = ++generation
@@ -67,12 +77,12 @@ class ReceiverEngine(private val wire: ReceiverWire,
                     "ok" -> {
                         accepted = true; deadline?.invoke(); deadline = null
                         publish(home.copy(registered = true))
-                        if (home.intent == PairingIntent.CREATE) rotation = later(ROTATE_MS) {
+                        if (mode == ReceiverMode.LEGACY && home.intent == PairingIntent.CREATE) rotation = later(ROTATE_MS) {
                             if (current(epoch) && home.phase == ReceiverPhase.PAIRING) create()
                         }
                     }
                     "conflict" -> {
-                        val code = registration?.retry(409)
+                        val code = if (mode == ReceiverMode.LEGACY) registration?.retry(409) else null
                         if (code == null) end("Pairing code already in use", true)
                         else { publish(home.copy(code = code)); open() }
                     }
@@ -135,6 +145,9 @@ class ReceiverEngine(private val wire: ReceiverWire,
         accepted = false; offerStarted = false; remoteSet = false; pending.clear(); registration = null
         val old = socket; socket = null; runCatching { old?.close() }
         val receiver = media; media = null; runCatching { receiver?.close() }
+        val acknowledgement = requestDisposed; requestDisposed = null
+        mode = ReceiverMode.LEGACY
+        acknowledgement?.invoke()
         publish(ReceiverHome())
     }
 }

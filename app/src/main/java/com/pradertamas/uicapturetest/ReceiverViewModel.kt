@@ -21,7 +21,8 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     val state = mutable.asStateFlow()
     private var native: WebRtcReceiverSession? = null
     private var view: WeakReference<SurfaceViewRenderer>? = null
-    private val engine: ReceiverEngine = ReceiverEngine(ReceiverSignaling(http, main), { candidate, failure ->
+    private val wire = ReceiverWireRouter(ReceiverSignaling(http, main))
+    private val engine: ReceiverEngine = ReceiverEngine(wire, { candidate, failure ->
         WebRtcReceiverSession(application, candidate, { engineConnection(it) }, failure,
             { rendered() }, { w, h -> mutable.value = mutable.value.copy(resolution = "$w × $h") },
             { mutable.value = mutable.value.copy(metrics = it) }).also { session ->
@@ -32,12 +33,25 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         val task = Runnable { action() }; main.postDelayed(task, delay)
         val cancel: () -> Unit = { main.removeCallbacks(task) }; cancel
     }, { home -> mutable.value = if (home.phase == ReceiverPhase.PAIRING) ReceiverUi(home) else mutable.value.copy(home = home); AppMediaRoles.receiverPhaseChanged() })
+    private val request = RequestReceiverOwner(engine, wire, ConnectionRequestMediaHandoff.process,
+        { action -> main.post { action() } })
     init {
         AppMediaRoles.bindReceiver(this, ::stop, { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) })
         ConnectionRequestRuntimeGate.runLegacyStart { engine.create() }
     }
     private fun engineConnection(state: String) { engine.connection(state) }
     private fun rendered() { engine.firstFrame() }
+    /** Explicit B4E entry point only. Renderer detach/reattach does not redeem or restart it. */
+    internal fun startRequest(handoff: String): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (AppMediaRoles.role != MediaRole.RECEIVE || request.active ||
+            !MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase)) return false
+        return request.start(handoff)
+    }
+    internal fun stopRequest(flow: Any): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        return request.stop(flow)
+    }
     fun ensureOwnCreate() {
         if (AppMediaRoles.role == MediaRole.RECEIVE && MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase))
             ConnectionRequestRuntimeGate.runLegacyStart {
