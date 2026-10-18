@@ -9,8 +9,8 @@ import java.util.concurrent.Executors
 internal class ConnectionRequestCreateAttempt internal constructor() {
     override fun toString() = "ConnectionRequestCreateAttempt[redacted]"
 }
-internal class ConnectionRequestRecipientContext {
-    override fun toString() = "ConnectionRequestRecipientContext[redacted]"
+internal class ConnectionRequestRecipientFlow {
+    override fun toString() = "ConnectionRequestRecipientFlow[redacted]"
 }
 internal data class ConnectionRequestRecipientAccess(val won: Boolean, val acceptAttempted: Boolean)
 
@@ -27,16 +27,22 @@ class ConnectionRequestController(
         val initiatorSecret: ConnectionCredential? = null, var claim: ConnectionCredential? = null,
         var won: Boolean = false, val expiryElapsedMs: Long? = null,
         val originAttempt: ConnectionRequestCreateAttempt? = null,
-        val recipientContext: ConnectionRequestRecipientContext? = null)
+        val recipientFlow: ConnectionRequestRecipientFlow? = null)
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
     private var currentCreateAttempt: ConnectionRequestCreateAttempt? = null
+    private var pendingCreateAttempt: ConnectionRequestCreateAttempt? = null
     private var activeOperation: ConnectionRequestOperation? = null
     private val mutable = MutableStateFlow(ConnectionRequestUiState())
     val state = mutable.asStateFlow()
+    private var publishedContext: Context? = null
+    private val ownershipRevision = MutableStateFlow(0L)
+    internal val ownershipChanges = ownershipRevision.asStateFlow()
     private fun rejected() { mutable.value = mutable.value.copy(error = ConnectionRequestError.INVALID_OPERATION) }
     private fun publish(c: Context?, operation: ConnectionRequestOperation? = null, error: ConnectionRequestError? = null) {
+        // Identity changes must wake scoped UI even when public snapshots conflate to equal values.
+        if (publishedContext !== c) { publishedContext = c; ownershipRevision.value++ }
         mutable.value = ConnectionRequestUiState(c?.side, c?.metadata, operation, error)
     }
     private fun auth(c: Context): ConnectionCredential = c.initiatorSecret ?: if (c.won) checkNotNull(c.claim) else c.capability
@@ -69,6 +75,7 @@ class ConnectionRequestController(
         val token = ++generation
         val attempt = ConnectionRequestCreateAttempt()
         currentCreateAttempt = attempt
+        pendingCreateAttempt = attempt
         val started = elapsedMs()
         context = null; activeOperation = ConnectionRequestOperation.CREATE; publish(null, activeOperation)
         worker.execute {
@@ -82,6 +89,7 @@ class ConnectionRequestController(
                 if (generation != token) abandoned = result.created
                 else {
                     activeOperation = null
+                    pendingCreateAttempt = null
                     val created = result.created
                     if (created != null && result.error == null && created.metadata.initiatorRole == role) {
                         // Create guarantees serverNow = creation time, expiresAt = creation + TTL.
@@ -104,28 +112,35 @@ class ConnectionRequestController(
         }
         attempt
     }
-    internal fun preview(id: String, capability: String, initiatorRole: MediaRole): ConnectionRequestRecipientContext? = synchronized(lock) {
+    internal fun preview(id: String, capability: String, initiatorRole: MediaRole): ConnectionRequestRecipientFlow? = synchronized(lock) {
         if (context != null || mutable.value.operation != null || !ConnectionRequestSecrets.canonical(id, 16) ||
             !ConnectionRequestSecrets.canonical(capability, 16)) { rejected(); return@synchronized null }
         ++generation
         currentCreateAttempt = null
-        val recipient = ConnectionRequestRecipientContext()
-        context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability), recipientContext = recipient)
+        pendingCreateAttempt = null
+        val recipient = ConnectionRequestRecipientFlow()
+        context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability), recipientFlow = recipient)
         publish(context)
         recipient
     }
-    internal fun recipientAccess(recipient: ConnectionRequestRecipientContext): ConnectionRequestRecipientAccess? = synchronized(lock) {
-        context?.takeIf { it.recipientContext === recipient }?.let { ConnectionRequestRecipientAccess(it.won, it.claim != null) }
+    internal fun recipientAccess(recipient: ConnectionRequestRecipientFlow): ConnectionRequestRecipientAccess? = synchronized(lock) {
+        context?.takeIf { it.recipientFlow === recipient }?.let { ConnectionRequestRecipientAccess(it.won, it.claim != null) }
     }
-    internal fun clearRecipient(recipient: ConnectionRequestRecipientContext, release: () -> Unit): Boolean = synchronized(lock) {
-        if (context?.recipientContext !== recipient) return@synchronized false
-        ++generation; context = null; activeOperation = null; currentCreateAttempt = null; publish(null)
+    internal fun clearRecipient(recipient: ConnectionRequestRecipientFlow, release: () -> Unit): Boolean = synchronized(lock) {
+        if (context?.recipientFlow !== recipient) return@synchronized false
+        ++generation; context = null; activeOperation = null; currentCreateAttempt = null; pendingCreateAttempt = null; publish(null)
         release(); true
     }
     /** Atomic completion policy: a superseding create cannot slip between validation and release.
      * The callback must be a short synchronous policy update, never I/O. */
     internal fun ifEmptyCurrentCreateAttempt(attempt: ConnectionRequestCreateAttempt, action: () -> Unit) = synchronized(lock) {
         if (currentCreateAttempt === attempt && context == null && activeOperation == null) action()
+    }
+    /** Pre-preview rollback only. Completed attempt lineage is not pending ownership.
+     * Validation and short, non-I/O policy callback share the controller lock. */
+    internal fun ifNoRequestOwnership(action: () -> Unit): Boolean = synchronized(lock) {
+        if (context != null || activeOperation != null || pendingCreateAttempt != null) return@synchronized false
+        action(); true
     }
     /** Narrow, memory-only explicit-share access. Never exposes initiator/claim authority.
      * Validity uses the original boot-relative deadline, never the phone's wall clock. */
@@ -140,25 +155,31 @@ class ConnectionRequestController(
         if (elapsedMs() >= deadline) return@synchronized null
         ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
-    fun refreshStatus() = operation(ConnectionRequestOperation.STATUS, { true }) {
+    fun refreshStatus() = refreshStatusFor(null)
+    internal fun refreshStatus(flow: ConnectionRequestRecipientFlow) = refreshStatusFor(flow)
+    private fun refreshStatusFor(flow: ConnectionRequestRecipientFlow?) = operation(ConnectionRequestOperation.STATUS, { true }, expectedFlow = flow) {
         api.status(it.id, auth(it), if (it.side == ConnectionRequestSide.INITIATOR) ConnectionRequestAuthScope.INITIATOR
             else if (it.won) ConnectionRequestAuthScope.CLAIM else ConnectionRequestAuthScope.CAPABILITY)
     }
-    fun accept() = operation(ConnectionRequestOperation.ACCEPT, {
+    fun accept() = acceptFor(null)
+    internal fun accept(flow: ConnectionRequestRecipientFlow) = acceptFor(flow)
+    private fun acceptFor(flow: ConnectionRequestRecipientFlow?) = operation(ConnectionRequestOperation.ACCEPT, {
         it.side == ConnectionRequestSide.RECIPIENT &&
             (it.metadata == null || it.metadata?.state == ConnectionRequestState.WAITING ||
                 it.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING))
-    }, prepare = { if (it.claim == null) it.claim = claimFactory() }) {
+    }, expectedFlow = flow, prepare = { if (it.claim == null) it.claim = claimFactory() }) {
         api.accept(it.id, it.capability, checkNotNull(it.claim))
     }
     fun cancel() = operation(ConnectionRequestOperation.CANCEL, {
         it.side == ConnectionRequestSide.INITIATOR && (it.metadata?.state?.activeSetup == true || it.metadata?.state == ConnectionRequestState.CANCELED)
     }) { api.cancel(it.id, checkNotNull(it.initiatorSecret)) }
-    fun withdraw() = operation(ConnectionRequestOperation.WITHDRAW, {
+    fun withdraw() = withdrawFor(null)
+    internal fun withdraw(flow: ConnectionRequestRecipientFlow) = withdrawFor(flow)
+    private fun withdrawFor(flow: ConnectionRequestRecipientFlow?) = operation(ConnectionRequestOperation.WITHDRAW, {
         it.side == ConnectionRequestSide.RECIPIENT && it.won &&
             (it.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING) ||
                 (it.metadata?.state == ConnectionRequestState.FAILED && it.metadata?.failureReason == "recipient_withdrew"))
-    }) { api.withdraw(it.id, checkNotNull(it.claim)) }
+    }, expectedFlow = flow) { api.withdraw(it.id, checkNotNull(it.claim)) }
     fun setReady(ready: Boolean) = operation(ConnectionRequestOperation.READINESS, {
         it.metadata?.state == ConnectionRequestState.ACCEPTED && (it.initiatorSecret != null || it.won)
     }) { api.ready(it.id, auth(it), ready, if (it.side == ConnectionRequestSide.INITIATOR)
@@ -167,10 +188,13 @@ class ConnectionRequestController(
         it.side == ConnectionRequestSide.INITIATOR && it.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)
     }) { api.session(it.id, checkNotNull(it.initiatorSecret)) }
     /** Local-only cleanup; callers must explicitly Cancel/withdraw before leaving live setup. */
-    fun clear() = synchronized(lock) { ++generation; currentCreateAttempt = null; context = null; activeOperation = null; publish(null) }
+    fun clear() = synchronized(lock) { ++generation; currentCreateAttempt = null; pendingCreateAttempt = null; context = null; activeOperation = null; publish(null) }
     private fun operation(op: ConnectionRequestOperation, allowed: (Context) -> Boolean,
+        expectedFlow: ConnectionRequestRecipientFlow? = null,
         prepare: (Context) -> Unit = {}, call: (Context) -> ConnectionRequestResult) = synchronized(lock) {
         val c = context
+        // Check scope BEFORE touching operation/error/claim. A stale caller is a strict no-op.
+        if (expectedFlow != null && (c?.side != ConnectionRequestSide.RECIPIENT || c.recipientFlow !== expectedFlow)) return@synchronized
         if (activeOperation != null) {
             if (op != ConnectionRequestOperation.STATUS)
                 mutable.value = mutable.value.copy(error = ConnectionRequestError.OPERATION_IN_PROGRESS)

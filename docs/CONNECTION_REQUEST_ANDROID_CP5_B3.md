@@ -15,8 +15,8 @@ It rejects query, userinfo, explicit ports, alternate origins/paths, duplicate o
 extra fields, missing values, alternate order/version, percent encoding, padding
 and noncanonical Base64URL. Parsed models have redacted string representations.
 The Activity captures raw input only on its stack and clears incoming/current
-Intent data BEFORE parsing, including onNewIntent. Only a non-secret ownership
-boolean is saved; no URL, identifier, capability or claim is saved/logged/rendered.
+Intent data BEFORE parsing, including onNewIntent. No ownership boolean or flow
+identity is saved; no URL, identifier, capability or claim is saved/logged/rendered.
 
 ## Entry, BUSY and ownership
 
@@ -32,10 +32,32 @@ SEND via hide + close or calls the registered RECEIVE owner stop callback. It ne
 switches media role or starts anything. Existing lifecycle/manual start gates prevent
 legacy restart. Invalid/BUSY/conflict entry cannot overwrite another request context.
 
-The process coordinator retains only an opaque recipient ownership token, safe UI
-state and last operation kind. Controller credentials stay private. Token-scoped
-query and atomic clear/release prevent this screen from clearing another context.
-onNewIntent conflicts are shown safely; an existing owned flow remains intact.
+Successful preview returns an opaque local ConnectionRequestRecipientFlow, which
+is also held privately in that recipient context. Initiator contexts have no such
+flow. It is an authority selector for local commands, never server authentication.
+The Activity-scoped ViewModel retains only its exact flow handle across rotation,
+with no Activity/Context reference, SavedState, Intent extra or persistence. Another
+Activity starts without a handle and cannot adopt any current context. A stale
+ViewModel likewise cannot adopt B via onNewIntent; it shows stale/unavailable UI.
+
+Every recipient status/Accept/withdraw command carries the flow. Matching and
+operation admission share the controller lock, BEFORE changing operation/error/claim.
+Stale commands are strict no-ops. Clear + gate release are atomic under that same
+lock and match the exact flow. Late withdraw success cannot clear a newer context.
+Generic foundation APIs remain available, but the recipient UI does not use them.
+
+The UI observes a flow-scoped projection combining coordinator/controller events
+and a private context-change revision (no flow identity in public state);
+the handle never enters public StateFlow. Even if B emits identical-looking WAITING
+state, stale A sees only stale/finished UI, never B's controls. All Back/retry/actions
+carry A's handle and cannot clear, Accept, withdraw or release B.
+
+Admission cleanup has two phases. BEFORE preview, failed idle-stop rollback uses
+ifNoRequestOwnership: context, active operation and pending create must all be absent;
+the check and short release callback share the controller lock. Completed create
+lineage is not pending ownership. If B starts/completes meanwhile, rollback is denied.
+A preview rejected after a racing B appears acquires no flow and performs no release.
+AFTER successful preview, only exact-flow cleanup is permitted; no global idle rollback.
 
 ## Preview, explicit Accept and exit
 
@@ -67,10 +89,13 @@ Release is a policy update and does not explicitly restart legacy pairing.
 
 ## Lifetime and boundary
 
-The process coordinator/controller survive configuration recreation; a saved non-secret
-owner flag reconnects the screen without parsing the scrubbed Intent or issuing another
-GET/Accept. UI state is reconstructed from the coordinator/controller event observation.
-Process-death recovery is not promised. With no process context and no bearer URI, the
+The process coordinator/controller and Activity ViewModel survive configuration
+recreation. The retained exact flow reconnects only to its own context, without
+parsing the scrubbed Intent or issuing another GET/Accept. Uncertain Accept state
+and the same claim survive rotation, and Back still cannot discard that authority.
+The ViewModel/token and controller credentials are lost on process death; no token
+is reconstructed from a Bundle. Process-death recovery is not promised. With no
+retained token/context and no bearer URI, the
 screen safely reports invalid input; a fresh delivered link may start a new preview.
 OS process termination is not interpreted as explicit user withdrawal.
 
