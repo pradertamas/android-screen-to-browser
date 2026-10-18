@@ -39,7 +39,7 @@ import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
     private var externalUi = false
-    private var remoteSharing = false
+    private val remoteSharing: Boolean get() = PairingHost.controller.sharedWaitingProtected
     private var consentEpoch = -1L
     private fun openReceiver() {
         try { startActivity(Intent(this, ReceiverActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
@@ -53,7 +53,6 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         traceActivity("activity-onResume")
-        if (remoteSharing) { remoteSharing = false; externalUi = false }
     }
     override fun onStart() {
         super.onStart()
@@ -61,9 +60,13 @@ class MainActivity : ComponentActivity() {
         if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()
         else if (!CaptureState.state.value.busy) PairingHost.controller.show()
     }
-    override fun onStop() { traceActivity("activity-onStop", !externalUi); if (!externalUi) PairingHost.controller.hide(); super.onStop() }
+    override fun onStop() {
+        val willCallHide = PairingHost.controller.shouldHideOnStop(externalUi)
+        traceActivity("activity-onStop", willCallHide)
+        if (willCallHide) PairingHost.controller.hide()
+        super.onStop()
+    }
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean("remoteSharing", remoteSharing)
         outState.putLong("consentEpoch", consentEpoch)
         outState.putBoolean("externalUi", externalUi)
         super.onSaveInstanceState(outState)
@@ -75,7 +78,6 @@ class MainActivity : ComponentActivity() {
         PairingHost.initialize(this)
         consentEpoch = savedInstanceState?.getLong("consentEpoch", -1L) ?: -1L
         externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
-        remoteSharing = savedInstanceState?.getBoolean("remoteSharing", false) ?: false
         enableEdgeToEdge()
         setContent {
             val state by CaptureState.state.collectAsState()
@@ -177,16 +179,17 @@ class MainActivity : ComponentActivity() {
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = {
+                            val alreadyProtected = PairingHost.controller.sharedWaitingProtected
                             try {
                                 val share = Intent(Intent.ACTION_SEND).apply {
                                     type = RemoteDevice.MIME_TYPE
                                     putExtra(Intent.EXTRA_SUBJECT, RemoteDevice.SUBJECT)
                                     putExtra(Intent.EXTRA_TEXT, PairingHost.remoteShareText())
                                 }
-                                remoteSharing = true; externalUi = true
+                                PairingHost.controller.protectSharedWaiting()
                                 startActivity(Intent.createChooser(share, "Share connection link"))
                             } catch (_: Exception) {
-                                remoteSharing = false; externalUi = false
+                                if (!alreadyProtected) PairingHost.controller.clearSharedWaitingProtection()
                                 remoteFeedback = "Link could not be shared. Please try again."
                             }
                         }) { path ->

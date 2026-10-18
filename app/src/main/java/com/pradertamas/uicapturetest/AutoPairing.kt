@@ -39,10 +39,28 @@ class AutoPairing(private val transport: PairingTransport,
     private var mediaEnd: (() -> Unit)? = null
     private var consentRequested = false
     private var visible = false
+    private var sharedWaitingEpoch: Long? = null
+    private fun sharedWaitingEligible(value: PairingHome) = value.intent == PairingIntent.CREATE &&
+        value.phase in setOf(PairingPhase.CREATING, PairingPhase.WAITING, PairingPhase.CONSENT)
+    val sharedWaitingProtected: Boolean get() = sharedWaitingEpoch == home.epoch && sharedWaitingEligible(home)
+    fun protectSharedWaiting() {
+        if (sharedWaitingEligible(home)) {
+            sharedWaitingEpoch = home.epoch
+            trace("shared-waiting-protection-enabled")
+        }
+    }
+    fun clearSharedWaitingProtection() {
+        if (sharedWaitingEpoch != null) { sharedWaitingEpoch = null; trace("shared-waiting-protection-cleared") }
+    }
+    fun shouldHideOnStop(externalUi: Boolean) = !externalUi && !sharedWaitingProtected
     private fun trace(event: String, fields: String = "") {
         runCatching { diagnostic("event=$event phase=${home.phase} epoch=${home.epoch} $fields") }
     }
-    private fun publish(value: PairingHome) { home = value; changed(home) }
+    private fun publish(value: PairingHome) {
+        if (sharedWaitingEpoch != null && (sharedWaitingEpoch != value.epoch || !sharedWaitingEligible(value)))
+            clearSharedWaitingProtection()
+        home = value; changed(home)
+    }
     fun show() { trace("show"); visible = true; if (home.phase == PairingPhase.STOPPED) create() }
     fun hide() {
         trace("hide", "visible_before=$visible hasMediaConsumer=${consumer != null}")
