@@ -58,7 +58,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         traceActivity("activity-onStart")
         if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()
-        else if (!CaptureState.state.value.busy) PairingHost.controller.show()
+        else if (!CaptureState.state.value.busy) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
     }
     override fun onStop() {
         val willCallHide = PairingHost.controller.shouldHideOnStop(externalUi)
@@ -116,26 +116,28 @@ class MainActivity : ComponentActivity() {
                 if (home.phase == PairingPhase.JOINING) joinCode = ""
                 if (state.busy) { ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=busy"); PairingHost.controller.hide(); return@LaunchedEffect }
                 if (lifecycleState == Lifecycle.State.RESUMED && mediaMode.role == MediaRole.SEND) {
-                    PairingHost.controller.show()
-                    val epoch = PairingHost.controller.claimConsent()
-                    if (epoch != null) {
-                        ScreenShareLifecycleDiag.write("event=consent-launch-requested epoch=$epoch")
-                        consentEpoch = epoch
-                        joinCode = ""
-                        externalUi = true
-                        WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing",
-                            pairingCode = home.code, intent = home.intent))
-                        try {
-                            ScreenShareLifecycleDiag.write("event=consent-launch epoch=$epoch")
-                            rtcConsent.launch(getSystemService(MediaProjectionManager::class.java)
-                                .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice()))
-                            ScreenShareLifecycleDiag.write("event=consent-launch-returned epoch=$epoch")
-                        } catch (_: Exception) {
-                            ScreenShareLifecycleDiag.write("event=consent-launch-failed epoch=$epoch")
-                            externalUi = false; WebRtcState.cancelConsent(); PairingHost.controller.cancel(epoch)
+                    ConnectionRequestRuntimeGate.runLegacyStart {
+                        PairingHost.controller.show()
+                        val epoch = PairingHost.controller.claimConsent()
+                        if (epoch != null) {
+                            ScreenShareLifecycleDiag.write("event=consent-launch-requested epoch=$epoch")
+                            consentEpoch = epoch
+                            joinCode = ""
+                            externalUi = true
+                            WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing",
+                                pairingCode = home.code, intent = home.intent))
+                            try {
+                                ScreenShareLifecycleDiag.write("event=consent-launch epoch=$epoch")
+                                rtcConsent.launch(getSystemService(MediaProjectionManager::class.java)
+                                    .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice()))
+                                ScreenShareLifecycleDiag.write("event=consent-launch-returned epoch=$epoch")
+                            } catch (_: Exception) {
+                                ScreenShareLifecycleDiag.write("event=consent-launch-failed epoch=$epoch")
+                                externalUi = false; WebRtcState.cancelConsent(); PairingHost.controller.cancel(epoch)
+                            }
+                        } else {
+                            ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=claim-null phase=${PairingHost.state.value.phase} epoch=${PairingHost.state.value.epoch}")
                         }
-                    } else {
-                        ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=claim-null phase=${PairingHost.state.value.phase} epoch=${PairingHost.state.value.epoch}")
                     }
                 } else {
                     val reason = if (lifecycleState != Lifecycle.State.RESUMED) "not-resumed" else "wrong-role"
@@ -194,7 +196,9 @@ class MainActivity : ComponentActivity() {
                             }
                         }) { path ->
                             if (path == ConnectionWorkflow.SHOW && AppMediaRoles.role == MediaRole.SEND) {
-                                ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
+                                ConnectionRequestRuntimeGate.runLegacyStart {
+                                    ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
+                                }
                             }
                             selectedPath = path
                         }
@@ -217,7 +221,7 @@ class MainActivity : ComponentActivity() {
                                         scanning = false
                                         externalUi = false
                                         val code = PairingCode.parseQr(barcode.rawValue.orEmpty())
-                                        if (code != null) PairingHost.controller.join(code)
+                                        if (code != null) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.join(code) }
                                         else PairingHost.controller.notice("QR code is not a valid connection code.")
                                     }
                                     .addOnCanceledListener { if (!isDestroyed && !isFinishing) { scanning = false; externalUi = false; PairingHost.controller.notice("Scan cancelled") } }
@@ -238,7 +242,7 @@ class MainActivity : ComponentActivity() {
                                 val normalized = AutoPairing.input(value)
                                 if (normalized != null) {
                                     joinCode = normalized
-                                    PairingHost.controller.typed(normalized)
+                                    ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.typed(normalized) }
                                 } else {
                                     PairingHost.controller.typed("")
                                     PairingHost.controller.notice("Invalid connection code")
@@ -246,7 +250,7 @@ class MainActivity : ComponentActivity() {
                             }, enabled = !scanning, label = { Text("Connection code") }, singleLine = true)
                             Button(modifier = Modifier.fillMaxWidth(), enabled = !scanning && !state.busy, onClick = {
                                 val code = PairingCode.normalize(joinCode)
-                                if (code != null) PairingHost.controller.join(code)
+                                if (code != null) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.join(code) }
                                 else PairingHost.controller.notice("Invalid connection code")
                             }) { Text("Connect") }
                             }

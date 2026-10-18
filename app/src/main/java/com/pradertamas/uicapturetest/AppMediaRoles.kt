@@ -29,7 +29,8 @@ object AppMediaRoles {
             MediaRole.RECEIVE -> { val old = receiver; receiver = null; old?.stop?.invoke() }
         }
     }, { requested ->
-        if (requested == MediaRole.SEND && !CaptureState.state.value.busy) PairingHost.controller.show()
+        if (requested == MediaRole.SEND && !CaptureState.state.value.busy)
+            ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
         // RECEIVE starts only when its retained owner is attached by ReceiverActivity.
     }, { mutable.value = it })
     fun switchRole(requested: MediaRole, stopActive: Boolean = false): Boolean {
