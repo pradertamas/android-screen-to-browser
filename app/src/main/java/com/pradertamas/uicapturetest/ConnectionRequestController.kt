@@ -9,6 +9,10 @@ import java.util.concurrent.Executors
 internal class ConnectionRequestCreateAttempt internal constructor() {
     override fun toString() = "ConnectionRequestCreateAttempt[redacted]"
 }
+internal class ConnectionRequestRecipientContext {
+    override fun toString() = "ConnectionRequestRecipientContext[redacted]"
+}
+internal data class ConnectionRequestRecipientAccess(val won: Boolean, val acceptAttempted: Boolean)
 
 /** Blocking HTTP lives on a serial worker; all context/publication changes share one lock.
  * No Activity, storage, polling, media-role mutation or automatic session start. */
@@ -22,7 +26,8 @@ class ConnectionRequestController(
         val id: String, val role: MediaRole, val capability: ConnectionCredential,
         val initiatorSecret: ConnectionCredential? = null, var claim: ConnectionCredential? = null,
         var won: Boolean = false, val expiryElapsedMs: Long? = null,
-        val originAttempt: ConnectionRequestCreateAttempt? = null)
+        val originAttempt: ConnectionRequestCreateAttempt? = null,
+        val recipientContext: ConnectionRequestRecipientContext? = null)
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
@@ -99,13 +104,23 @@ class ConnectionRequestController(
         }
         attempt
     }
-    fun preview(id: String, capability: String, initiatorRole: MediaRole) = synchronized(lock) {
+    internal fun preview(id: String, capability: String, initiatorRole: MediaRole): ConnectionRequestRecipientContext? = synchronized(lock) {
         if (context != null || mutable.value.operation != null || !ConnectionRequestSecrets.canonical(id, 16) ||
-            !ConnectionRequestSecrets.canonical(capability, 16)) { rejected(); return@synchronized }
+            !ConnectionRequestSecrets.canonical(capability, 16)) { rejected(); return@synchronized null }
         ++generation
         currentCreateAttempt = null
-        context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability))
+        val recipient = ConnectionRequestRecipientContext()
+        context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability), recipientContext = recipient)
         publish(context)
+        recipient
+    }
+    internal fun recipientAccess(recipient: ConnectionRequestRecipientContext): ConnectionRequestRecipientAccess? = synchronized(lock) {
+        context?.takeIf { it.recipientContext === recipient }?.let { ConnectionRequestRecipientAccess(it.won, it.claim != null) }
+    }
+    internal fun clearRecipient(recipient: ConnectionRequestRecipientContext, release: () -> Unit): Boolean = synchronized(lock) {
+        if (context?.recipientContext !== recipient) return@synchronized false
+        ++generation; context = null; activeOperation = null; currentCreateAttempt = null; publish(null)
+        release(); true
     }
     /** Atomic completion policy: a superseding create cannot slip between validation and release.
      * The callback must be a short synchronous policy update, never I/O. */

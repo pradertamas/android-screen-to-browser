@@ -4,6 +4,14 @@ import android.os.Looper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+/** Pure stop dispatch; callers supply the current role and the existing idle policy. */
+internal fun stopIdleLegacyOwner(role: MediaRole, canStop: () -> Boolean,
+    stopSender: () -> Unit, stopReceiver: () -> Unit): Boolean {
+    if (!canStop()) return false
+    when (role) { MediaRole.SEND -> stopSender(); MediaRole.RECEIVE -> stopReceiver() }
+    return true
+}
+
 /** Sole app media-role owner. Application lifetime, SEND on fresh process; no saved preference. */
 object AppMediaRoles {
     private val mutable = MutableStateFlow(MediaRoleState())
@@ -40,6 +48,12 @@ object AppMediaRoles {
     fun pairingAllowed(): Boolean = when (role) {
         MediaRole.SEND -> MediaRolePolicy.senderSwitchAllowed(PairingHost.state.value.phase, CaptureState.state.value.busy, WebRtcState.state.value.busy)
         MediaRole.RECEIVE -> receiver?.canLeave?.invoke() ?: true
+    }
+    /** Caller ARMs the start gate first; this synchronous main-thread hook never changes role. */
+    fun stopIdleLegacyForRequestFirst(): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        return stopIdleLegacyOwner(role, ::pairingAllowed,
+            { PairingHost.controller.hide(); PairingHost.controller.close() }, { receiver?.stop?.invoke() })
     }
     fun receiverStartFailed() {
         switchRole(MediaRole.SEND, stopActive = true)
