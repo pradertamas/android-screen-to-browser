@@ -28,6 +28,7 @@ object PairingHost {
     val mediaRole = MediaRole.SEND
     val controller = AutoPairing(object : PairingTransport {
         override fun open(code: String, intent: PairingIntent, message: (String, String, String) -> Unit, ended: () -> Unit): PairingLink {
+            val callbackEpoch = state.value.epoch
             var registrationSeen = false
             var remoteSupported = false
             val ws = http.newWebSocket(Request.Builder()
@@ -40,13 +41,15 @@ object PairingHost {
                             registrationSeen = true
                             remoteSupported = m.optString("status") == "ok" && m.optBoolean("remotePresence", false)
                         }
+                        if (m.optString("type") in setOf("peer-present", "peer-left", "bye"))
+                            lifecycleSignal(m.optString("type"), callbackEpoch)
                         message(m.optString("type"), m.optString("status"), text)
-                    } catch (_: Exception) { ended() }
+                    } catch (_: Exception) { lifecycleSignal("parse-failure", callbackEpoch); ended() }
                 } }
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { response?.close(); main.post { ended() } }
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { main.post { ended() } }
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { response?.close(); main.post { lifecycleSignal("failure", callbackEpoch); ended() } }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { main.post { lifecycleSignal("closed", callbackEpoch); ended() } }
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                    webSocket.close(code, null); main.post { ended() }
+                    webSocket.close(code, null); main.post { lifecycleSignal("closing", callbackEpoch); ended() }
                 }
             })
             return object : PairingLink {
@@ -59,6 +62,10 @@ object PairingHost {
         val task = Runnable { action() }; main.postDelayed(task, delay)
         val cancel: () -> Unit = { main.removeCallbacks(task) }
         cancel
-    }, { mutable.value = it }, remoteToken = { tokens?.get() })
+    }, { mutable.value = it }, remoteToken = { tokens?.get() }, diagnostic = ScreenShareLifecycleDiag::write)
+    private fun lifecycleSignal(event: String, callbackEpoch: Long) {
+        val home = state.value
+        ScreenShareLifecycleDiag.write("event=socket-$event phase=${home.phase} epoch=${home.epoch} callbackEpoch=$callbackEpoch current=${callbackEpoch == home.epoch}")
+    }
     fun post(action: (AutoPairing) -> Unit) { main.post { action(controller) } }
 }

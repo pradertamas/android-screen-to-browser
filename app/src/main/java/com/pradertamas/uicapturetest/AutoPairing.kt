@@ -17,7 +17,8 @@ class AutoPairing(private val transport: PairingTransport,
     private val later: (Long, () -> Unit) -> (() -> Unit),
     private val changed: (PairingHome) -> Unit,
     private val generate: () -> String = PairingCode::generate,
-    private val remoteToken: () -> String? = { null }) {
+    private val remoteToken: () -> String? = { null },
+    private val diagnostic: (String) -> Unit = {}) {
     companion object {
         const val ROTATE_MS = 300_000L
         const val DEBOUNCE_MS = 250L
@@ -38,12 +39,16 @@ class AutoPairing(private val transport: PairingTransport,
     private var mediaEnd: (() -> Unit)? = null
     private var consentRequested = false
     private var visible = false
+    private fun trace(event: String, fields: String = "") {
+        runCatching { diagnostic("event=$event phase=${home.phase} epoch=${home.epoch} $fields") }
+    }
     private fun publish(value: PairingHome) { home = value; changed(home) }
-    fun show() { visible = true; if (home.phase == PairingPhase.STOPPED) create() }
+    fun show() { trace("show"); visible = true; if (home.phase == PairingPhase.STOPPED) create() }
     fun hide() {
+        trace("hide", "visible_before=$visible hasMediaConsumer=${consumer != null}")
         visible = false
         // Scanner/consent overlays are handled by the Activity, not treated as navigation.
-        if (home.phase !in setOf(PairingPhase.CONNECTING, PairingPhase.STREAMING) && consumer == null) close()
+        if (home.phase !in setOf(PairingPhase.CONNECTING, PairingPhase.STREAMING) && consumer == null) { trace("hide-closing"); close() }
     }
     fun editable() = home.phase in setOf(PairingPhase.CREATING, PairingPhase.WAITING, PairingPhase.ERROR)
     fun notice(text: String) { publish(home.copy(notice = text)) }
@@ -75,7 +80,9 @@ class AutoPairing(private val transport: PairingTransport,
         link = transport.open(home.code, home.intent, { type, status, raw ->
             if (epoch == home.epoch && registration?.attempts == attempt) {
                 when (type) {
-                    "registration" -> when (status) {
+                    "registration" -> {
+                        trace("registration", "result=" + status.takeIf { it in setOf("ok", "conflict", "not-found", "rate-limited", "role-occupied") }.orEmpty().ifEmpty { "other" })
+                        when (status) {
                         "ok" -> {
                             timeout?.invoke(); timeout = null
                             publish(home.copy(phase = PairingPhase.WAITING))
@@ -93,18 +100,26 @@ class AutoPairing(private val transport: PairingTransport,
                         "rate-limited" -> failed("Too many attempts. Please wait and try again.")
                         else -> failed("Pairing code already in use.")
                     }
-                    "peer-present" -> if (home.phase == PairingPhase.WAITING) {
+                    }
+                    "peer-present" -> {
+                        trace("peer-present", "phase_before=${home.phase} visible=$visible consentRequested=$consentRequested")
+                        if (home.phase == PairingPhase.WAITING) {
                         rotation?.invoke(); rotation = null
                         publish(home.copy(phase = PairingPhase.CONSENT, notice = ""))
                     }
-                    "peer-left", "bye" -> failed("Disconnected")
+                        trace("peer-present-applied", "phase_after=${home.phase} consentRequested=$consentRequested")
+                    }
+                    "peer-left", "bye" -> { trace(type); failed("Disconnected") }
                     else -> consumer?.invoke(raw)
                 }
             }
-        }, { if (epoch == home.epoch && registration?.attempts == attempt) failed("Connection failed. Please try again.") })
+        }, { if (epoch == home.epoch && registration?.attempts == attempt) { trace("socket-ended"); failed("Connection failed. Please try again.") } })
     }
     fun claimConsent(): Long? {
-        if (home.phase != PairingPhase.CONSENT || consentRequested) return null
+        if (home.phase != PairingPhase.CONSENT || consentRequested) {
+            trace("claim-consent", "consentRequested_before=$consentRequested result=null"); return null
+        }
+        trace("claim-consent", "consentRequested_before=$consentRequested result=granted")
         consentRequested = true; return home.epoch
     }
     fun refreshRemotePresence() {
@@ -115,7 +130,10 @@ class AutoPairing(private val transport: PairingTransport,
         }
     }
     fun allow(epoch: Long): Boolean {
-        if (epoch != home.epoch || home.phase != PairingPhase.CONSENT || !consentRequested) return false
+        if (epoch != home.epoch || home.phase != PairingPhase.CONSENT || !consentRequested) {
+            trace("allow", "currentPhase=${home.phase} currentEpoch=${home.epoch} requestedEpoch=$epoch result=false"); return false
+        }
+        trace("allow", "currentPhase=${home.phase} currentEpoch=${home.epoch} requestedEpoch=$epoch result=true")
         publish(home.copy(phase = PairingPhase.CONNECTING)); return true
     }
     fun cancel(epoch: Long) { if (epoch == home.epoch) failed("Sharing cancelled") }
@@ -140,11 +158,13 @@ class AutoPairing(private val transport: PairingTransport,
         if (visible) recovery = later(1000) { recovery = null; create(text) }
     }
     fun close() {
+        trace("close", "phase_before=${home.phase} epoch_before=${home.epoch}")
         rotation?.invoke(); timeout?.invoke(); input?.invoke(); recovery?.invoke()
         rotation = null; timeout = null; input = null; recovery = null
         consumer = null; mediaEnd = null; registration = null; consentRequested = false
         val old = link; link = null
         publish(PairingHome(epoch = home.epoch + 1, notice = home.notice))
         old?.close()
+        trace("closed", "phase_after=${home.phase} epoch_after=${home.epoch}")
     }
 }

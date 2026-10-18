@@ -45,16 +45,23 @@ class MainActivity : ComponentActivity() {
         try { startActivity(Intent(this, ReceiverActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
         catch (_: Exception) { AppMediaRoles.receiverStartFailed() }
     }
+    private fun traceActivity(event: String, willCallHide: Boolean? = null) {
+        val home = PairingHost.state.value
+        ScreenShareLifecycleDiag.write("event=$event lifecycle=${lifecycle.currentState} phase=${home.phase} epoch=${home.epoch} externalUi=$externalUi remoteSharing=$remoteSharing role=${AppMediaRoles.role} captureBusy=${CaptureState.state.value.busy}" + (willCallHide?.let { " willCallHide=$it" } ?: ""))
+    }
+    override fun onPause() { traceActivity("activity-onPause"); super.onPause() }
     override fun onResume() {
         super.onResume()
+        traceActivity("activity-onResume")
         if (remoteSharing) { remoteSharing = false; externalUi = false }
     }
     override fun onStart() {
         super.onStart()
+        traceActivity("activity-onStart")
         if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()
         else if (!CaptureState.state.value.busy) PairingHost.controller.show()
     }
-    override fun onStop() { if (!externalUi) PairingHost.controller.hide(); super.onStop() }
+    override fun onStop() { traceActivity("activity-onStop", !externalUi); if (!externalUi) PairingHost.controller.hide(); super.onStop() }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean("remoteSharing", remoteSharing)
         outState.putLong("consentEpoch", consentEpoch)
@@ -103,24 +110,34 @@ class MainActivity : ComponentActivity() {
                 }
             }
             LaunchedEffect(home.phase, lifecycleState, state.busy, mediaMode.role) {
+                ScreenShareLifecycleDiag.write("event=consent-effect phase=${home.phase} epoch=${home.epoch} lifecycle=$lifecycleState role=${mediaMode.role} busy=${state.busy}")
                 if (home.phase == PairingPhase.JOINING) joinCode = ""
-                if (state.busy) { PairingHost.controller.hide(); return@LaunchedEffect }
+                if (state.busy) { ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=busy"); PairingHost.controller.hide(); return@LaunchedEffect }
                 if (lifecycleState == Lifecycle.State.RESUMED && mediaMode.role == MediaRole.SEND) {
                     PairingHost.controller.show()
                     val epoch = PairingHost.controller.claimConsent()
                     if (epoch != null) {
+                        ScreenShareLifecycleDiag.write("event=consent-launch-requested epoch=$epoch")
                         consentEpoch = epoch
                         joinCode = ""
                         externalUi = true
                         WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing",
                             pairingCode = home.code, intent = home.intent))
                         try {
+                            ScreenShareLifecycleDiag.write("event=consent-launch epoch=$epoch")
                             rtcConsent.launch(getSystemService(MediaProjectionManager::class.java)
                                 .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice()))
+                            ScreenShareLifecycleDiag.write("event=consent-launch-returned epoch=$epoch")
                         } catch (_: Exception) {
+                            ScreenShareLifecycleDiag.write("event=consent-launch-failed epoch=$epoch")
                             externalUi = false; WebRtcState.cancelConsent(); PairingHost.controller.cancel(epoch)
                         }
+                    } else {
+                        ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=claim-null phase=${PairingHost.state.value.phase} epoch=${PairingHost.state.value.epoch}")
                     }
+                } else {
+                    val reason = if (lifecycleState != Lifecycle.State.RESUMED) "not-resumed" else "wrong-role"
+                    ScreenShareLifecycleDiag.write("event=consent-effect-blocked reason=$reason")
                 }
             }
             val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
