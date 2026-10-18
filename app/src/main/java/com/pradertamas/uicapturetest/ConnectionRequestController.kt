@@ -175,6 +175,21 @@ class ConnectionRequestController(
         ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
     fun refreshStatus() = refreshStatusFor(null)
+    internal fun protectedSignalingBootstrap(flow: ConnectionRequestCreateAttempt): ProtectedSignalingBootstrap? = protectedBootstrap(flow)
+    internal fun protectedSignalingBootstrap(flow: ConnectionRequestRecipientFlow): ProtectedSignalingBootstrap? = protectedBootstrap(flow)
+    /** Read-only, exact-flow authority export. No socket creation or public state changes here. */
+    private fun protectedBootstrap(flow: Any): ProtectedSignalingBootstrap? = synchronized(lock) {
+        val c = context ?: return@synchronized null
+        val initiator = c.side == ConnectionRequestSide.INITIATOR
+        if ((if (initiator) c.originAttempt else c.recipientFlow) !== flow ||
+            c.metadata?.state != ConnectionRequestState.CONNECTING || (!initiator && (!c.won || c.claim == null))) return@synchronized null
+        val assignment = c.metadata?.assignment ?: return@synchronized null
+        val role = if (initiator) c.role else if (c.role == MediaRole.SEND) MediaRole.RECEIVE else MediaRole.SEND
+        if (assignment.role != role || assignment.intent != (if (initiator) PairingIntent.CREATE else PairingIntent.JOIN) ||
+            PairingCode.normalize(assignment.code) != assignment.code) return@synchronized null
+        runCatching { ProtectedSignalingBootstrap.create(flow, assignment.code, role, assignment.intent,
+            c.id, if (initiator) checkNotNull(c.initiatorSecret) else checkNotNull(c.claim)) }.getOrNull()
+    }
     internal fun setupSnapshot(): ConnectionRequestSetupSnapshot? = synchronized(lock) {
         val c = context ?: return@synchronized null
         val flow = c.originAttempt ?: c.recipientFlow ?: return@synchronized null

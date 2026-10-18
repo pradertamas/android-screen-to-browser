@@ -45,6 +45,8 @@ class ConnectionRequestSetupTest {
         var ir = false; var rr = false
         var readyError: ConnectionRequestError? = null; var sessionError: ConnectionRequestError? = null
         var statusError: ConnectionRequestError? = null; var retry: Long? = null
+        var withdrawError: ConnectionRequestError? = null
+        val readyTimes = mutableListOf<Long>(); val statusTimes = mutableListOf<Long>()
         var lostSession = false; var malformed = false; var onSession: (() -> Unit)? = null
         val scopes = mutableListOf<ConnectionRequestAuthScope>(); val auths = mutableListOf<ConnectionCredential>()
         val instant = Instant.parse("2026-01-01T00:00:00Z")
@@ -63,6 +65,7 @@ class ConnectionRequestSetupTest {
             }
             override fun status(id: String, auth: ConnectionCredential, scope: ConnectionRequestAuthScope): ConnectionRequestResult {
                 statusCalls++; scopes.add(scope); auths.add(auth)
+                statusTimes.add(clock.now)
                 return if (statusError != null) ConnectionRequestResult(error = statusError, retryAfterSeconds = retry)
                     else ConnectionRequestResult(metadata(id, scope == ConnectionRequestAuthScope.CLAIM))
             }
@@ -72,6 +75,7 @@ class ConnectionRequestSetupTest {
             }
             override fun ready(id: String, auth: ConnectionCredential, ready: Boolean, scope: ConnectionRequestAuthScope): ConnectionRequestResult {
                 assertTrue(ready); readyCalls++; auths.add(auth); scopes.add(scope)
+                readyTimes.add(clock.now)
                 if (readyError != null) return ConnectionRequestResult(error = readyError, retryAfterSeconds = retry)
                 return ConnectionRequestResult(ConnectionRequestMetadata(id, ConnectionRequestState.ACCEPTED, instant,
                     ready = true, readyUntil = instant.plusSeconds(10)))
@@ -87,7 +91,9 @@ class ConnectionRequestSetupTest {
             }
             override fun cancel(id: String, auth: ConnectionCredential) = ConnectionRequestResult()
             override fun withdraw(id: String, auth: ConnectionCredential): ConnectionRequestResult {
-                withdraws++; server = ConnectionRequestState.FAILED
+                withdraws++
+                if (withdrawError != null) return ConnectionRequestResult(error = withdrawError)
+                server = ConnectionRequestState.FAILED
                 return ConnectionRequestResult(metadata(id, true).copy(failureReason = "recipient_withdrew"))
             }
         }
@@ -111,6 +117,33 @@ class ConnectionRequestSetupTest {
         fun status() { controller.refreshStatus(); settle() }
     }
 
+    @Test fun recipientStatusAndReadinessNeitherStarveAcrossTwentySeconds() {
+        val f = Fixture(); f.role = MediaRole.RECEIVE; val flow = f.recipient()
+        f.statusTimes.clear(); f.foregroundRecipient(flow)
+        repeat(20) { f.advance(1000) }
+        assertEquals(listOf(0L, 5000L, 10000L, 15000L, 20000L), f.readyTimes)
+        assertEquals((0L..20000L step 2000).toList(), f.statusTimes)
+        assertEquals(1, f.clock.active.size)
+    }
+    @Test fun withdrawNetworkFailureBlocksStaleRenewalAndQueuedRoleCommand() {
+        val f = Fixture(); f.role = MediaRole.RECEIVE; val flow = f.recipient(); f.foregroundRecipient(flow)
+        f.advance(4000); val staleReady = f.clock.active.single()
+        assertEquals(5000L, staleReady.due)
+        f.role = MediaRole.SEND; f.setup.changed(); assertEquals(1, f.main.tasks.size)
+        // Same production beforeWithdraw boundary, before the mutation is admitted.
+        f.setup.suspendRecipient(flow); f.withdrawError = ConnectionRequestError.NETWORK
+        val claim = f.auths.last()
+        f.controller.withdraw(flow); f.worker.run(); staleReady.action(); f.settle()
+        val ready = f.readyCalls; val status = f.statusCalls; val switches = f.switches
+        f.advance(20000)
+        assertEquals(ready, f.readyCalls); assertEquals(status, f.statusCalls); assertEquals(switches, f.switches)
+        assertTrue(f.clock.active.isEmpty()); assertTrue(f.gate)
+        assertTrue(f.controller.recipientAccess(flow)!!.won); assertTrue(f.controller.recipientAccess(flow)!!.acceptAttempted)
+        assertEquals(ConnectionRequestState.ACCEPTED, f.controller.state.value.request?.state)
+        f.withdrawError = null; f.controller.withdraw(flow); f.worker.run()
+        assertEquals(ConnectionRequestState.FAILED, f.controller.state.value.request?.state)
+        assertEquals(2, f.withdraws); assertEquals(token(40, 32), claim.value)
+    }
     @Test fun matchingInitiatorReadinessUsesPrivateInitiatorScope() {
         val f = Fixture(); val flow = f.initiator(); assertTrue(f.controller.setInitiatorReady(flow)); f.worker.run()
         assertEquals(1, f.readyCalls); assertEquals(ConnectionRequestAuthScope.INITIATOR, f.scopes.last())
