@@ -129,12 +129,15 @@ class ReceiverActivity : ComponentActivity() {
                                                 type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
                                             }, "Share connection link"))
                                         } catch (_: Exception) { sharingLink = false; error = "Link could not be shared. Please try again." }
-                                    }, shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE) { selectedPath = it }
+                                    }, shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE) { path ->
+                                        if (path == ConnectionWorkflow.SHOW) model.ensureOwnCreate()
+                                        selectedPath = path
+                                    }
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     }
                                     if (activePath != null) WorkflowPanel(activePath, canChoose, { code = ""; error = ""; selectedPath = null }) {
                                         if (phase == ReceiverPhase.PAIRING) {
-                                            if (activePath == ConnectionWorkflow.SHOW && ui.home.intent == PairingIntent.CREATE) {
+                                            if (activePath == ConnectionWorkflow.SHOW && ShowConnection.receiverReady(ui.home)) {
                                                 WorkflowOwnCode(ui.home.code)
                                             }
                                             if (activePath == ConnectionWorkflow.CONNECT) {

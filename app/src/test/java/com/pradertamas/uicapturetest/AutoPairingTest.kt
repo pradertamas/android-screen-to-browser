@@ -109,4 +109,21 @@ class AutoPairingTest {
         h.engine.mediaStopped(epoch); assertEquals(count + 1, h.peers.size)
         h.engine.mediaStopped(epoch); assertEquals(count + 1, h.peers.size)
     }
+    @Test fun showKeepsOwnCreateButReplacesJoinWithoutConsent() {
+        val h = Harness(); h.waiting()
+        val own = h.peers.last()
+        repeat(3) { ShowConnection.ensureSender(h.engine.home) { h.engine.create() } }
+        assertEquals(1, h.peers.size); assertFalse(own.closed)
+        h.engine.join("6K4M2Q"); val joined = h.peers.last()
+        ShowConnection.ensureSender(h.engine.home) { h.engine.create() }
+        assertTrue(joined.closed); assertEquals(PairingIntent.CREATE, h.peers.last().intent)
+        assertEquals(PairingPhase.CREATING, h.engine.home.phase)
+        assertFalse(ShowConnection.senderReady(h.engine.home)); assertNull(h.engine.claimConsent())
+        val count = h.peers.size
+        ShowConnection.ensureSender(h.engine.home) { h.engine.create() }
+        assertEquals(count, h.peers.size)
+        h.peers.last().event("registration", "ok")
+        assertTrue(ShowConnection.senderReady(h.engine.home)); assertNull(h.engine.claimConsent())
+        assertTrue(MediaRole.SEND.offerer)
+    }
 }

@@ -148,4 +148,30 @@ class ReceiverEngineTest {
         assertEquals(ReceiverPhase.ERROR, f.engine.home.phase)
         f.engine.create(); assertEquals(ReceiverPhase.PAIRING, f.engine.home.phase)
     }
+    @Test fun showKeepsOwnCreateAndReplacesJoinErrorAndEnded() {
+        val f = Fixture(); f.engine.create(); val own = f.links.last()
+        repeat(3) { ShowConnection.ensureReceiver(f.engine.home) { f.engine.create() } }
+        assertEquals(1, f.links.size); assertFalse(ShowConnection.receiverReady(f.engine.home))
+        own.events.registration("ok"); assertTrue(ShowConnection.receiverReady(f.engine.home))
+        ShowConnection.ensureReceiver(f.engine.home) { f.engine.create() }
+        assertEquals(1, f.links.size)
+        f.engine.join("8K4M2Q"); val joined = f.links.last()
+        joined.events.registration("ok"); assertFalse(ShowConnection.receiverReady(f.engine.home))
+        ShowConnection.ensureReceiver(f.engine.home) { f.engine.create() }
+        assertEquals(1, joined.closes); assertEquals(PairingIntent.CREATE, f.links.last().intent)
+        assertFalse(ShowConnection.receiverReady(f.engine.home)); assertTrue(f.media.isEmpty())
+        for (ended in listOf(false, true)) {
+            val old = f.links.last()
+            if (ended) old.events.ended() else old.events.registration("not-found")
+            assertTrue(f.engine.home.phase in setOf(ReceiverPhase.ERROR, ReceiverPhase.ENDED))
+            ShowConnection.ensureReceiver(f.engine.home) { f.engine.create() }
+            assertEquals(PairingIntent.CREATE, f.links.last().intent)
+            assertEquals(ReceiverPhase.PAIRING, f.engine.home.phase)
+            assertFalse(ShowConnection.receiverReady(f.engine.home))
+            f.links.last().events.registration("ok")
+            assertTrue(ShowConnection.receiverReady(f.engine.home))
+        }
+        assertFalse(MediaRole.RECEIVE.offerer); assertFalse(MediaRole.RECEIVE.captureAllowed)
+        assertTrue(f.media.isEmpty())
+    }
 }

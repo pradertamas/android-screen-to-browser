@@ -41,7 +41,7 @@ class ConnectionWorkflowTest {
             assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)"))
             assertTrue(activity.contains("padding(24.dp)"))
         }
-        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("}) { selectedPath = it }")
+        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("}) { path ->")
         assertTrue(topShare.contains("PairingHost.remoteShareText()"))
         assertTrue(topShare.contains("startActivity(Intent.createChooser"))
         assertFalse(topShare.contains("createScreenCaptureIntent")); assertFalse(topShare.contains("controller.join"))

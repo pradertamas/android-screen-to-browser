@@ -169,13 +169,18 @@ class MainActivity : ComponentActivity() {
                                 remoteSharing = false; externalUi = false
                                 remoteFeedback = "Link could not be shared. Please try again."
                             }
-                        }) { selectedPath = it }
+                        }) { path ->
+                            if (path == ConnectionWorkflow.SHOW && AppMediaRoles.role == MediaRole.SEND) {
+                                ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
+                            }
+                            selectedPath = path
+                        }
                         if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
                         }
                         if (activePath != null) WorkflowPanel(activePath, canChoose, {
                             PairingHost.controller.typed(""); joinCode = ""; selectedPath = null
                         }) {
-                            if (activePath == ConnectionWorkflow.SHOW && home.code.isNotEmpty() && home.intent == PairingIntent.CREATE && !rtc.busy) {
+                            if (activePath == ConnectionWorkflow.SHOW && ShowConnection.senderReady(home) && !rtc.busy) {
                                 WorkflowOwnCode(home.code)
                             }
                             if (activePath == ConnectionWorkflow.CONNECT && PairingHost.controller.editable() && !rtc.busy) {

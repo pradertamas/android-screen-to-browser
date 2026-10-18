@@ -38,6 +38,10 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     }
     private fun engineConnection(state: String) { engine.connection(state) }
     private fun rendered() { engine.firstFrame() }
+    fun ensureOwnCreate() {
+        if (AppMediaRoles.role == MediaRole.RECEIVE && MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase))
+            ShowConnection.ensureReceiver(state.value.home) { engine.create() }
+    }
     fun retry() { if (AppMediaRoles.role == MediaRole.RECEIVE) engine.create() }
     fun join(value: String) = AppMediaRoles.role == MediaRole.RECEIVE && engine.join(value)
     fun attach(renderer: SurfaceViewRenderer) { view = WeakReference(renderer); native?.attach(renderer) }

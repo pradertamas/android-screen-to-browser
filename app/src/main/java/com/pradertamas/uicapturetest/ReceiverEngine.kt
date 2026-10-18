@@ -2,7 +2,7 @@ package com.pradertamas.uicapturetest
 
 enum class ReceiverPhase { PAIRING, CONNECTING, RECEIVING, ENDED, ERROR }
 data class ReceiverHome(val phase: ReceiverPhase = ReceiverPhase.ENDED, val code: String = "",
-    val intent: PairingIntent = PairingIntent.CREATE, val status: String = "Ready to receive")
+    val intent: PairingIntent = PairingIntent.CREATE, val status: String = "Ready to receive", val registered: Boolean = false)
 data class ReceiverIce(val mid: String?, val line: Int, val candidate: String)
 interface ReceiverEvents {
     fun registration(status: String)
@@ -57,6 +57,7 @@ class ReceiverEngine(private val wire: ReceiverWire,
     private fun open() {
         val epoch = ++generation
         accepted = false
+        if (home.registered) publish(home.copy(registered = false))
         val old = socket; socket = null; old?.close()
         deadline?.invoke(); deadline = later(15_000) { if (current(epoch)) end("Connection failed", true) }
         socket = wire.open(home.code, home.intent, object : ReceiverEvents {
@@ -65,6 +66,7 @@ class ReceiverEngine(private val wire: ReceiverWire,
                 when (status) {
                     "ok" -> {
                         accepted = true; deadline?.invoke(); deadline = null
+                        publish(home.copy(registered = true))
                         if (home.intent == PairingIntent.CREATE) rotation = later(ROTATE_MS) {
                             if (current(epoch) && home.phase == ReceiverPhase.PAIRING) create()
                         }
