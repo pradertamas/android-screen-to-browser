@@ -21,9 +21,11 @@ data class ConnectionRequestMetadata(
     val initiatorRole: MediaRole? = null, val createdAt: Instant? = null, val expiresAt: Instant? = null,
     val acceptedAt: Instant? = null, val connectBy: Instant? = null,
     val assignment: ConnectionAssignment? = null, val failureReason: String? = null,
-    val ready: Boolean? = null, val readyUntil: Instant? = null, val connectedAt: Instant? = null
+    val ready: Boolean? = null, val readyUntil: Instant? = null, val connectedAt: Instant? = null,
+    val initiatorReady: Boolean? = null, val recipientReady: Boolean? = null
 )
-enum class ConnectionRequestError { NETWORK, UNAVAILABLE, CONFLICT, EXPIRED, RATE_LIMITED, SERVER, INVALID_REQUEST, INVALID_RESPONSE, INVALID_OPERATION }
+enum class ConnectionRequestError { NETWORK, UNAVAILABLE, CONFLICT, EXPIRED, RATE_LIMITED, SERVER, INVALID_REQUEST, INVALID_RESPONSE, INVALID_OPERATION, OPERATION_IN_PROGRESS, CONFIGURATION }
+enum class ConnectionRequestAuthScope { INITIATOR, CAPABILITY, CLAIM }
 enum class ConnectionRequestOperation { CREATE, PREVIEW, STATUS, ACCEPT, CANCEL, WITHDRAW, READINESS, SESSION }
 enum class ConnectionRequestSide { INITIATOR, RECIPIENT }
 data class ConnectionRequestUiState(

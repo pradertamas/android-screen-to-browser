@@ -19,6 +19,7 @@ class ConnectionRequestController(
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
+    private var activeOperation: ConnectionRequestOperation? = null
     private val mutable = MutableStateFlow(ConnectionRequestUiState())
     val state = mutable.asStateFlow()
     private fun rejected() { mutable.value = mutable.value.copy(error = ConnectionRequestError.INVALID_OPERATION) }
@@ -53,7 +54,7 @@ class ConnectionRequestController(
             rejected(); return@synchronized
         }
         val token = ++generation
-        context = null; publish(null, ConnectionRequestOperation.CREATE)
+        context = null; activeOperation = ConnectionRequestOperation.CREATE; publish(null, activeOperation)
         worker.execute {
             val cancellation = if (old?.metadata?.state?.activeSetup == true)
                 safe { api.cancel(old.id, checkNotNull(old.initiatorSecret)) } else null
@@ -64,6 +65,7 @@ class ConnectionRequestController(
             synchronized(lock) {
                 if (generation != token) abandoned = result.created
                 else {
+                    activeOperation = null
                     val created = result.created
                     if (created != null && result.error == null && created.metadata.initiatorRole == role) {
                         context = Context(ConnectionRequestSide.INITIATOR, created.metadata, created.metadata.requestId,
@@ -83,7 +85,10 @@ class ConnectionRequestController(
         context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability))
         publish(context)
     }
-    fun refreshStatus() = operation(ConnectionRequestOperation.STATUS, { true }) { api.status(it.id, auth(it)) }
+    fun refreshStatus() = operation(ConnectionRequestOperation.STATUS, { true }) {
+        api.status(it.id, auth(it), if (it.side == ConnectionRequestSide.INITIATOR) ConnectionRequestAuthScope.INITIATOR
+            else if (it.won) ConnectionRequestAuthScope.CLAIM else ConnectionRequestAuthScope.CAPABILITY)
+    }
     fun accept() = operation(ConnectionRequestOperation.ACCEPT, {
         it.side == ConnectionRequestSide.RECIPIENT &&
             (it.metadata == null || it.metadata?.state == ConnectionRequestState.WAITING ||
@@ -101,24 +106,32 @@ class ConnectionRequestController(
     }) { api.withdraw(it.id, checkNotNull(it.claim)) }
     fun setReady(ready: Boolean) = operation(ConnectionRequestOperation.READINESS, {
         it.metadata?.state == ConnectionRequestState.ACCEPTED && (it.initiatorSecret != null || it.won)
-    }) { api.ready(it.id, auth(it), ready) }
+    }) { api.ready(it.id, auth(it), ready, if (it.side == ConnectionRequestSide.INITIATOR)
+        ConnectionRequestAuthScope.INITIATOR else ConnectionRequestAuthScope.CLAIM) }
     fun createSession() = operation(ConnectionRequestOperation.SESSION, {
         it.side == ConnectionRequestSide.INITIATOR && it.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)
     }) { api.session(it.id, checkNotNull(it.initiatorSecret)) }
     /** Local-only cleanup; callers must explicitly Cancel/withdraw before leaving live setup. */
-    fun clear() = synchronized(lock) { ++generation; context = null; publish(null) }
+    fun clear() = synchronized(lock) { ++generation; context = null; activeOperation = null; publish(null) }
     private fun operation(op: ConnectionRequestOperation, allowed: (Context) -> Boolean,
         prepare: (Context) -> Unit = {}, call: (Context) -> ConnectionRequestResult) = synchronized(lock) {
         val c = context
+        if (activeOperation != null) {
+            if (op != ConnectionRequestOperation.STATUS)
+                mutable.value = mutable.value.copy(error = ConnectionRequestError.OPERATION_IN_PROGRESS)
+            return@synchronized
+        }
         if (c == null || !allowed(c)) { rejected(); return@synchronized }
         try { prepare(c) } catch (_: Exception) { publish(c, error = ConnectionRequestError.INVALID_RESPONSE); return@synchronized }
-        val token = ++generation
+        val token = generation
+        activeOperation = op
         publish(c, op)
         worker.execute {
             if (!synchronized(lock) { generation == token && context === c }) return@execute
             val result = safe { call(c) }
             synchronized(lock) {
                 if (generation != token || context !== c) return@synchronized
+                activeOperation = null
                 val update = result.metadata
                 if (update != null && !validUpdate(c, update, op)) {
                     publish(c, error = ConnectionRequestError.INVALID_RESPONSE); return@synchronized
