@@ -102,7 +102,9 @@ class SharedWaitingLifecycleTest {
         val resume = source.substringAfter("override fun onResume()").substringBefore("override fun onStart()")
         assertFalse(resume.contains("clearSharedWaitingProtection")); assertFalse(resume.contains("externalUi = false"))
         assertFalse(source.contains("putBoolean(\"remoteSharing\""))
-        assertTrue(source.contains("PairingHost.controller.protectSharedWaiting()"))
+        // Normal Share is now HTTP request-first; the compatibility engine keeps its policy.
+        assertFalse(source.contains("PairingHost.controller.protectSharedWaiting()"))
+        assertTrue(source.contains("rememberRequestShare(mediaMode.role)"))
         assertTrue(source.contains("lifecycleState == Lifecycle.State.RESUMED && mediaMode.role == MediaRole.SEND"))
         assertTrue(source.contains("claimConsent()")); assertTrue(source.contains("createConfigForUserChoice()"))
     }

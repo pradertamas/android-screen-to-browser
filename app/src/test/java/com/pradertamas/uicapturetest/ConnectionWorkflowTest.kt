@@ -31,26 +31,26 @@ class ConnectionWorkflowTest {
             assertTrue(activity.contains("MediaRoleSelector(mediaMode.role")); assertTrue(activity.contains("Advanced diagnostics"))
         }
     }
-    @Test fun mainShareUsesRemoteLinkAndReceiverUsesItsSessionWithoutNas() {
+    @Test fun mainAndReceiverShareUseRequestFirstWithoutNas() {
         val main = text("MainActivity.kt")
         val receiver = text("ReceiverActivity.kt")
         for (activity in listOf(main, receiver)) {
             assertFalse(activity.contains("AppPairing"))
-            assertTrue(activity.contains("Intent.ACTION_SEND")); assertTrue(activity.contains("Intent.createChooser"))
+            assertTrue(activity.contains("rememberRequestShare(mediaMode.role)"))
+            assertTrue(activity.contains("share = requestShare.start"))
             assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)"))
             assertTrue(activity.contains("overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)"))
             assertTrue(activity.contains("padding(24.dp)"))
         }
-        val topShare = main.substringAfter("WorkflowStart(canChoose").substringBefore("}) { path ->")
-        assertTrue(topShare.contains("PairingHost.remoteShareText()"))
-        assertTrue(topShare.contains("startActivity(Intent.createChooser"))
-        assertFalse(topShare.contains("createScreenCaptureIntent")); assertFalse(topShare.contains("controller.join"))
-        assertTrue(receiver.substringAfter("WorkflowStart(canChoose").substringBefore("val activePath").contains("PairingCode.receiverUrl(ui.home.code)"))
+        val shareUi = text("ConnectionRequestShareUi.kt")
+        assertTrue(shareUi.contains("Intent.ACTION_SEND")); assertTrue(shareUi.contains("Intent.createChooser"))
+        assertFalse(main.contains("PairingHost.remoteShareText()"))
+        assertFalse(receiver.contains("PairingCode.receiverUrl(ui.home.code)"))
         val roleSwitch = main.substringAfter("if (requested != mediaMode.role").substringBefore("if (mediaMode.error")
         assertTrue(roleSwitch.contains("AppMediaRoles.switchRole(requested)"))
         assertTrue(roleSwitch.contains("selectedPath = null; joinCode = \"\""))
         assertFalse(roleSwitch.contains("createScreenCaptureIntent"))
-        assertTrue(receiver.contains("shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE"))
+        assertTrue(receiver.contains("shareEnabled = canChoose && !requestShare.busy"))
         val selector = text("MediaRoleSelector.kt")
         assertTrue(selector.contains("activeContainerColor = Color(0xFF245C3A)"))
         assertTrue(selector.contains("inactiveContainerColor = MaterialTheme.colorScheme.surface"))

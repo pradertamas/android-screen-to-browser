@@ -9,8 +9,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.ViewModelProvider
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -32,7 +30,6 @@ class ReceiverActivity : ComponentActivity() {
     private lateinit var model: ReceiverViewModel
     private var renderer: SurfaceViewRenderer? = null
     private var scanning by mutableStateOf(false)
-    private var sharingLink = false
     private fun scanCode(done: (String) -> Unit, failure: (String) -> Unit) {
         if (scanning || AppMediaRoles.role != MediaRole.RECEIVE || model.state.value.home.phase != ReceiverPhase.PAIRING) return
         scanning = true
@@ -78,9 +75,9 @@ class ReceiverActivity : ComponentActivity() {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }
         })
         setContent {
-            val connectionShare = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { sharingLink = false }
             val ui by model.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
+            val requestShare = rememberRequestShare(mediaMode.role) { model.stop() }
             val phase = ui.home.phase
             var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var code by rememberSaveable { mutableStateOf("") }
@@ -132,18 +129,13 @@ class ReceiverActivity : ComponentActivity() {
                                         if (requested == MediaRole.SEND) returnToSend()
                                     }
                                     if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                                    WorkflowStart(canChoose, selectedPath, share = {
-                                        try {
-                                            val url = PairingCode.receiverUrl(ui.home.code)
-                                            sharingLink = true
-                                            connectionShare.launch(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                                                type = "text/plain"; putExtra(Intent.EXTRA_TEXT, url)
-                                            }, "Share connection link"))
-                                        } catch (_: Exception) { sharingLink = false; error = "Link could not be shared. Please try again." }
-                                    }, shareEnabled = canChoose && phase == ReceiverPhase.PAIRING && ui.home.intent == PairingIntent.CREATE) { path ->
+                                    WorkflowStart(canChoose, selectedPath, share = requestShare.start,
+                                        shareEnabled = canChoose && !requestShare.busy) { path ->
                                         if (path == ConnectionWorkflow.SHOW) model.ensureOwnCreate()
+                                        if (path == ConnectionWorkflow.CONNECT && phase == ReceiverPhase.ENDED) model.retry()
                                         selectedPath = path
                                     }
+                                    if (requestShare.message.isNotEmpty()) Text(requestShare.message)
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     }
                                     if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {
@@ -179,7 +171,7 @@ class ReceiverActivity : ComponentActivity() {
         }
     }
     override fun onStop() {
-        if (::model.isInitialized && !isChangingConfigurations && !scanning && !sharingLink) model.stop()
+        if (::model.isInitialized && !isChangingConfigurations && !scanning) model.stop()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }

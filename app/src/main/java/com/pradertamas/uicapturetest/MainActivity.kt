@@ -83,6 +83,10 @@ class MainActivity : ComponentActivity() {
             val state by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
+            val requestShare = rememberRequestShare(mediaMode.role) {
+                PairingHost.controller.hide()
+                PairingHost.controller.close()
+            }
             var diagnostics by remember { mutableStateOf(false) }
             var scanning by remember { mutableStateOf(false) }
             val home by PairingHost.state.collectAsState()
@@ -180,28 +184,18 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
-                        if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = {
-                            val alreadyProtected = PairingHost.controller.sharedWaitingProtected
-                            try {
-                                val share = Intent(Intent.ACTION_SEND).apply {
-                                    type = RemoteDevice.MIME_TYPE
-                                    putExtra(Intent.EXTRA_SUBJECT, RemoteDevice.SUBJECT)
-                                    putExtra(Intent.EXTRA_TEXT, PairingHost.remoteShareText())
-                                }
-                                PairingHost.controller.protectSharedWaiting()
-                                startActivity(Intent.createChooser(share, "Share connection link"))
-                            } catch (_: Exception) {
-                                if (!alreadyProtected) PairingHost.controller.clearSharedWaitingProtection()
-                                remoteFeedback = "Link could not be shared. Please try again."
-                            }
-                        }) { path ->
+                        if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = requestShare.start,
+                            shareEnabled = canChoose && !requestShare.busy) { path ->
                             if (path == ConnectionWorkflow.SHOW && AppMediaRoles.role == MediaRole.SEND) {
                                 ConnectionRequestRuntimeGate.runLegacyStart {
                                     ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
                                 }
                             }
+                            if (path == ConnectionWorkflow.CONNECT && home.phase == PairingPhase.STOPPED)
+                                ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
                             selectedPath = path
                         }
+                        if (requestShare.message.isNotEmpty()) Text(requestShare.message)
                         if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
                         }
                         if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {

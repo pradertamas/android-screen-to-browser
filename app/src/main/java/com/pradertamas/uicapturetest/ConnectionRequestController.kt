@@ -10,12 +10,13 @@ import java.util.concurrent.Executors
 class ConnectionRequestController(
     private val api: ConnectionRequestApi,
     private val worker: Executor = Executors.newSingleThreadExecutor(),
+    private val elapsedNanos: () -> Long = System::nanoTime,
     private val claimFactory: () -> ConnectionCredential = ConnectionRequestSecrets::claim
 ) {
     private class Context(val side: ConnectionRequestSide, var metadata: ConnectionRequestMetadata?,
         val id: String, val role: MediaRole, val capability: ConnectionCredential,
         val initiatorSecret: ConnectionCredential? = null, var claim: ConnectionCredential? = null,
-        var won: Boolean = false)
+        var won: Boolean = false, var observedAtNanos: Long = 0)
     private val lock = Any()
     private var context: Context? = null
     private var generation = 0L
@@ -69,7 +70,7 @@ class ConnectionRequestController(
                     val created = result.created
                     if (created != null && result.error == null && created.metadata.initiatorRole == role) {
                         context = Context(ConnectionRequestSide.INITIATOR, created.metadata, created.metadata.requestId,
-                            role, created.capability, created.initiatorSecret)
+                            role, created.capability, created.initiatorSecret, observedAtNanos = elapsedNanos())
                         publish(context, error = cancellation?.error)
                     } else publish(null, error = result.error ?: ConnectionRequestError.INVALID_RESPONSE)
                 }
@@ -84,6 +85,18 @@ class ConnectionRequestController(
         ++generation
         context = Context(ConnectionRequestSide.RECIPIENT, null, id, initiatorRole, ConnectionCredential(capability))
         publish(context)
+    }
+    /** Narrow, memory-only explicit-share access. Never exposes initiator/claim authority.
+     * Use server remaining lifetime + elapsed time, not the phone's wall clock. */
+    internal fun shareableInitiatorData(role: MediaRole): ConnectionRequestShareData? = synchronized(lock) {
+        val c = context ?: return@synchronized null
+        val m = c.metadata ?: return@synchronized null
+        if (activeOperation != null || c.side != ConnectionRequestSide.INITIATOR || c.role != role ||
+            m.state != ConnectionRequestState.WAITING || m.expiresAt == null) return@synchronized null
+        val remaining = runCatching { java.time.Duration.between(m.serverNow, m.expiresAt).toNanos() }.getOrNull()
+            ?: return@synchronized null
+        if ((elapsedNanos() - c.observedAtNanos).coerceAtLeast(0) >= remaining) return@synchronized null
+        ConnectionRequestShareData(c.id, c.capability.value, c.role)
     }
     fun refreshStatus() = operation(ConnectionRequestOperation.STATUS, { true }) {
         api.status(it.id, auth(it), if (it.side == ConnectionRequestSide.INITIATOR) ConnectionRequestAuthScope.INITIATOR
@@ -137,6 +150,7 @@ class ConnectionRequestController(
                     publish(c, error = ConnectionRequestError.INVALID_RESPONSE); return@synchronized
                 }
                 if (update != null) {
+                    c.observedAtNanos = elapsedNanos()
                     val old = c.metadata
                     // Cancel/withdraw/readiness responses intentionally contain only a small projection.
                     c.metadata = update.copy(initiatorRole = c.role, createdAt = update.createdAt ?: old?.createdAt,
