@@ -185,7 +185,7 @@ class MainActivity : ComponentActivity() {
                                 WorkflowOwnCode(home.code)
                             }
                             if (activePath == ConnectionWorkflow.CONNECT && PairingHost.controller.editable() && !rtc.busy) {
-                            Button(enabled = !state.busy && !scanning, onClick = {
+                            Button(modifier = Modifier.fillMaxWidth(), enabled = !state.busy && !scanning, onClick = {
                                 PairingHost.controller.typed("")
                                 scanning = true
                                 externalUi = true

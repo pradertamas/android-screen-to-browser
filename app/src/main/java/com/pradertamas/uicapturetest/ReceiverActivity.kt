@@ -144,7 +144,7 @@ class ReceiverActivity : ComponentActivity() {
                                                 WorkflowOwnCode(ui.home.code)
                                             }
                                             if (activePath == ConnectionWorkflow.CONNECT) {
-                                                Button(enabled = !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
+                                                Button(modifier = Modifier.fillMaxWidth(), enabled = !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
                                                 OutlinedTextField(code, { value ->
                                                     val normalized = AutoPairing.input(value)
                                                     if (normalized != null) { code = normalized; error = "" }
