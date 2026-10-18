@@ -65,17 +65,45 @@ binary input and oversized inbound fail closed. Inbound/outbound text limit is
 
 Local close uses 1000. Server 1008, unexpected close or socket failure produces a
 generic failure event without reason, exception, URL or body output. No automatic
-retry, new code generation or legacy fallback exists. The OkHttp adapter has no
-logging interceptor, disables connection retry and redirects, and is instantiated
+retry, new code generation or legacy fallback exists. The OkHttp adapter owns a
+dedicated private client, accepts no injected client or interceptors, disables
+connection retry and both HTTP/SSL redirects, and is instantiated
 only by an explicit future caller. Tests use fake factories without internet.
 
 ## Concurrency and checkpoint limits
 
-Transport state and sends are serialized by a lock. Auth reserves its state before
-send, including synchronous fake callbacks. Consumer events are queued in order
-and drain through a testable dispatch boundary outside the state lock. Pending
-handoff/payload events are discarded on terminal failure/local close. No Activity
-is retained. The controller never opens a socket under its lock.
+Transport state and send admission are serialized by a lock. Phase one performs
+only state/reference/queue bookkeeping and captures effects. Phase two runs all
+socket sends, close/cancel, bootstrap consumption and consumer dispatch outside
+that lock. Auth reserves AUTH_SENT before the send effect; a synchronous nested
+registration sees the correct state without an outer lock. A false auth send
+terminalizes even if its nested callback reached REGISTERED. Consumer draining
+waits for outstanding effects, so that failure can purge the nested registered
+notification before delivery.
+
+All terminal paths share one helper: FAILED, local CLOSED and normal remote
+CLOSED purge the entire pending queue and retain only one terminal notification.
+Late failure/close callbacks are inert. Events drain in order with one drain owner
+through a testable dispatch boundary; reentrant send/close cannot start a second
+drain. A peer callback closing the transport purges later queued payloads. Taking
+an event from the queue is its delivery-admission point; an already admitted or
+executing callback cannot be retracted by a concurrent close. No still-pending
+non-terminal callback survives terminalization. No Activity is retained, and the
+controller never opens a socket under its lock.
+
+Application send uses atomic admission semantics: terminal before admission means
+false, otherwise the captured socket may be called outside the lock even if a
+concurrent later close/failure occurs. True means that admitted socket accepted
+the text, not that the transport is still live when send returns or that the
+network delivered it. Network send is not atomic with later close.
+
+FIX1 tests cover normal remote-close backlog purge, exactly-once terminal races,
+nested synchronous registration, auth-send=false precedence, consumer reentrant
+send/close, and explicit Thread.holdsLock checks via test-only reflection (no
+production lock exposure). Inbound and outbound exact size boundaries are
+65535 allowed, 65536 allowed, 65537 rejected; multibyte limits use UTF-8 bytes.
+A credential-free adapter policy seam verifies all redirect/retry flags are false
+and both interceptor lists are empty. The adapter has no client-injection API.
 
 There is no Activity wiring, WebRtcService/ReceiverEngine request-first start,
 PeerConnection, offer/answer/ICE generation, MediaProjection consent or stream.

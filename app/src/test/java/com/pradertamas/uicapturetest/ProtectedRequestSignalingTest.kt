@@ -66,9 +66,12 @@ class ProtectedRequestSignalingTest {
     }
     private class FakeSocket : ProtectedSocket {
         val frames = mutableListOf<String>(); val closes = mutableListOf<Int>(); var canceled = false; var sendOk = true
-        override fun send(text: String): Boolean { frames.add(text); return sendOk }
-        override fun close(code: Int) { closes.add(code) }
-        override fun cancel() { canceled = true }
+        var onSend: ((String) -> Unit)? = null
+        var onClose: (() -> Unit)? = null
+        var probe: (() -> Unit)? = null
+        override fun send(text: String): Boolean { probe?.invoke(); frames.add(text); onSend?.invoke(text); return sendOk }
+        override fun close(code: Int) { probe?.invoke(); closes.add(code); onClose?.invoke() }
+        override fun cancel() { probe?.invoke(); canceled = true }
     }
     private class FakeFactory : ProtectedSocketFactory {
         val socket = FakeSocket(); lateinit var listener: ProtectedSocketListener; var opens = 0; var url: String? = null
@@ -79,11 +82,15 @@ class ProtectedRequestSignalingTest {
     private class Events : ProtectedSignalingEvents {
         var registered = 0; var present = 0; var failures = 0; var closed = 0
         val payloads = mutableListOf<String>(); val order = mutableListOf<String>()
-        override fun registered() { registered++; order.add("registered") }
-        override fun peerPresent() { present++; order.add("present") }
-        override fun payload(text: String) { payloads.add(text); order.add("payload") }
-        override fun failed() { failures++; order.add("failed") }
-        override fun closed() { closed++; order.add("closed") }
+        var probe: (() -> Unit)? = null
+        var onRegistered: (() -> Unit)? = null
+        var onPresent: (() -> Unit)? = null
+        var onPayload: (() -> Unit)? = null
+        override fun registered() { probe?.invoke(); registered++; order.add("registered"); onRegistered?.invoke() }
+        override fun peerPresent() { probe?.invoke(); present++; order.add("present"); onPresent?.invoke() }
+        override fun payload(text: String) { probe?.invoke(); payloads.add(text); order.add("payload"); onPayload?.invoke() }
+        override fun failed() { probe?.invoke(); failures++; order.add("failed") }
+        override fun closed() { probe?.invoke(); closed++; order.add("closed") }
     }
     private inner class TransportFixture(dispatch: (() -> Unit) -> Unit = { it() }, b: ProtectedSignalingBootstrap = bootstrap()) {
         val factory = FakeFactory(); val events = Events()
@@ -175,6 +182,138 @@ class ProtectedRequestSignalingTest {
         assertFalse(ConnectionRequestUiState::class.java.declaredFields.any { it.type == ProtectedSignalingBootstrap::class.java || it.type == ConnectionCredential::class.java })
         assertFalse(f.controller.state.value.toString().contains(secret)); assertFalse(f.controller.state.value.toString().contains(claim))
     }
+    private fun stateLock(transport: ProtectedRequestSignaling) = transport.javaClass.getDeclaredField("lock")
+        .apply { isAccessible = true }.get(transport)
+    @Test fun remoteNormalClosePurgesRegistrationPeerAndPayloadBacklog() {
+        val queue = Queue(); val f = TransportFixture({ action -> queue.execute { action() } })
+        f.register(); f.text("""{"type":"peer-present"}"""); f.text(offer)
+        f.factory.listener.closed(1000); f.factory.listener.failed(); queue.run()
+        assertEquals(listOf("closed"), f.events.order); assertTrue(f.events.payloads.isEmpty())
+        assertEquals(0, f.events.registered); assertEquals(0, f.events.present)
+    }
+    @Test fun terminalRacesPurgeBacklogAndNotifyOnlyOnce() {
+        for (reason in listOf("failure", "protocol", "1008", "binary", "oversize", "local")) {
+            val queue = Queue(); val f = TransportFixture({ action -> queue.execute { action() } }); f.register()
+            f.text("""{"type":"peer-present"}"""); f.text(offer)
+            when (reason) {
+                "failure" -> f.factory.listener.failed()
+                "protocol" -> f.text("invalid-json")
+                "1008" -> f.factory.listener.closed(1008)
+                "binary" -> f.factory.listener.binary()
+                "oversize" -> f.text("x".repeat(65537))
+                else -> f.transport.close()
+            }
+            f.factory.listener.closed(1000); f.factory.listener.failed(); queue.run()
+            assertEquals(reason, listOf(if (reason == "local") "closed" else "failed"), f.events.order)
+            assertTrue(f.events.payloads.isEmpty())
+        }
+    }
+    @Test fun synchronousNestedRegistrationAndAllEffectsRunOutsideStateLock() {
+        val f = TransportFixture(); val held = mutableListOf<Boolean>(); val lock = stateLock(f.transport)
+        f.socket.probe = { held.add(Thread.holdsLock(lock)) }
+        f.events.probe = { held.add(Thread.holdsLock(lock)) }
+        f.socket.onSend = { if (JSONObject(it).getString("type") == "request-auth") f.text(registration()) }
+        f.opened(); assertEquals(1, f.events.registered)
+        f.text("""{"type":"peer-present"}"""); f.text(offer); f.factory.listener.failed()
+        assertEquals(1, f.events.failures); assertTrue(f.socket.canceled)
+        assertTrue(held.size >= 7); assertTrue(held.none { it })
+    }
+    @Test fun falseAuthSendWinsOverSynchronousSuccessfulRegistration() {
+        val f = TransportFixture(); f.socket.sendOk = false
+        f.socket.onSend = { f.text(registration()) }
+        f.opened(); assertEquals(listOf("failed"), f.events.order)
+        assertFalse(f.transport.send(offer)); assertEquals(1, f.socket.frames.size)
+        f.factory.listener.closed(1008); assertEquals(1, f.events.failures)
+    }
+    @Test fun registeredConsumerCanReentrantlySendThenCloseOutsideLock() {
+        val f = TransportFixture(); val trace = mutableListOf<String>(); val held = mutableListOf<Boolean>()
+        val lock = stateLock(f.transport)
+        f.socket.onSend = { text ->
+            trace.add(JSONObject(text).getString("type"))
+            if (JSONObject(text).getString("type") == "request-auth") f.text(registration())
+        }
+        var accepted = false
+        f.events.onRegistered = {
+            held.add(Thread.holdsLock(lock)); trace.add("registered")
+            accepted = f.transport.send(offer); f.transport.close()
+        }
+        f.opened()
+        assertTrue(accepted); assertEquals(listOf("request-auth", "registered", "offer"), trace)
+        assertEquals(listOf("registered", "closed"), f.events.order); assertEquals(listOf(false), held)
+    }
+    @Test fun peerConsumerReentrantClosePurgesLaterPayloadOutsideLock() {
+        val queue = Queue(); val f = TransportFixture({ action -> queue.execute { action() } }); f.register()
+        val lock = stateLock(f.transport); var held = true
+        f.events.onPresent = { held = Thread.holdsLock(lock); f.transport.close() }
+        f.text("""{"type":"peer-present"}"""); f.text(offer); queue.run()
+        assertFalse(held); assertEquals(listOf("registered", "present", "closed"), f.events.order)
+        assertTrue(f.events.payloads.isEmpty())
+    }
+    @Test fun messageConsumerReentrantClosePurgesNextMessage() {
+        val queue = Queue(); val f = TransportFixture({ action -> queue.execute { action() } }); f.register()
+        var held = true
+        f.events.onPayload = { held = Thread.holdsLock(stateLock(f.transport)); f.transport.close() }
+        f.text(offer); f.text(offer); queue.run()
+        assertFalse(held); assertEquals(1, f.events.payloads.size); assertEquals("closed", f.events.order.last())
+    }
+    @Test fun synchronousCloseCallbacksCannotDuplicateTerminalOrRunUnderLock() {
+        val f = TransportFixture(); f.register(); val held = mutableListOf<Boolean>(); val lock = stateLock(f.transport)
+        f.socket.probe = { held.add(Thread.holdsLock(lock)) }; f.events.probe = { held.add(Thread.holdsLock(lock)) }
+        f.socket.onClose = { f.factory.listener.closed(1008); f.factory.listener.failed() }
+        f.text("invalid-json")
+        assertEquals(1, f.events.failures); assertTrue(held.isNotEmpty()); assertTrue(held.none { it })
+    }
+    @Test fun socketFactoryAndEarlyOpenAreOutsideStateLock() {
+        var factoryHeld = true; var socketHeld = true; var transport: ProtectedRequestSignaling? = null
+        val socket = FakeSocket(); val events = Events()
+        val result = ProtectedRequestSignaling.open(bootstrap(), ProtectedSocketFactory { _, listener ->
+            transport = listener as ProtectedRequestSignaling
+            val lock = stateLock(transport!!); factoryHeld = Thread.holdsLock(lock)
+            socket.probe = { socketHeld = Thread.holdsLock(lock) }
+            listener.opened(socket); socket
+        }, events)
+        assertSame(transport, result); assertFalse(factoryHeld); assertFalse(socketHeld)
+    }
+    @Test fun sendAdmissionAllowsConcurrentLaterFailureButRejectsSubsequentSend() {
+        val f = TransportFixture(); f.register()
+        val entered = java.util.concurrent.CountDownLatch(1); val release = java.util.concurrent.CountDownLatch(1)
+        f.socket.onSend = { entered.countDown(); release.await(2, java.util.concurrent.TimeUnit.SECONDS) }
+        var accepted = false
+        val thread = Thread { accepted = f.transport.send(offer) }.apply { start() }
+        assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        f.factory.listener.failed(); assertFalse(f.transport.send(offer))
+        release.countDown(); thread.join(2000); assertFalse(thread.isAlive)
+        assertTrue(accepted); assertEquals(1, f.events.failures)
+    }
+    private fun sizedOffer(bytes: Int): String {
+        val prefix = "{\"type\":\"offer\",\"sdp\":\""; val suffix = "\"}"
+        return prefix + "x".repeat(bytes - prefix.length - suffix.length) + suffix
+    }
+    @Test fun exactUtf8BoundaryTripletInboundAndOutbound() {
+        for (bytes in listOf(65535, 65536, 65537)) {
+            val text = sizedOffer(bytes); assertEquals(bytes, text.toByteArray(Charsets.UTF_8).size)
+            val outbound = TransportFixture(); outbound.register()
+            assertEquals(bytes <= 65536, outbound.transport.send(text))
+            assertEquals(if (bytes <= 65536) 2 else 1, outbound.socket.frames.size)
+            val inbound = TransportFixture(); inbound.register(); inbound.text(text)
+            assertEquals(if (bytes <= 65536) 1 else 0, inbound.events.payloads.size)
+            assertEquals(if (bytes <= 65536) 0 else 1, inbound.events.failures)
+        }
+    }
+    @Test fun multibyteOutboundRejectsByBytesNotCharacters() {
+        val text = "{\"type\":\"offer\",\"sdp\":\"${"é".repeat(33000)}\"}"
+        assertTrue(text.length < 65536); assertTrue(text.toByteArray(Charsets.UTF_8).size > 65536)
+        val f = TransportFixture(); f.register(); assertFalse(f.transport.send(text)); assertEquals(1, f.socket.frames.size)
+    }
+    @Test fun hardenedFactoryHasNoClientInjectionOrInterceptorsAndDisablesRedirectAndRetry() {
+        val factory = OkHttpProtectedSocketFactory(); val policy = factory.policy()
+        assertFalse(policy.followRedirects); assertFalse(policy.followSslRedirects); assertFalse(policy.retryOnConnectionFailure)
+        assertEquals(0, policy.applicationInterceptors); assertEquals(0, policy.networkInterceptors)
+        assertTrue(factory.javaClass.declaredConstructors.none { ctor -> ctor.parameterTypes.any { it == okhttp3.OkHttpClient::class.java } })
+        val f = TransportFixture()
+        assertThrows(IllegalArgumentException::class.java) { factory.open("ws://invalid/ws", f.factory.listener) }
+    }
+    @Test fun unknownTypeStillFailsClosed() { val f = TransportFixture(); f.register(); f.text("""{"type":"unknown-control"}"""); assertEquals(1, f.events.failures); assertTrue(f.events.payloads.isEmpty()) }
     private fun source(name: String) = listOf(File("src/main/java/com/pradertamas/uicapturetest/$name.kt"), File("app/src/main/java/com/pradertamas/uicapturetest/$name.kt")).first { it.isFile }.readText()
     @Test fun noActivityOrSetupAutoOpenAndNoBearerPersistence() { for (name in listOf("MainActivity", "ReceiverActivity", "ConnectionRequestActivity", "ConnectionRequestSetupCoordinator", "ConnectionRequestInitiatorMonitor")) { val text = source(name); assertFalse(text.contains("ProtectedRequestSignaling")); assertFalse(text.contains("protectedSignalingBootstrap(")) }; val text = source("ProtectedRequestSignaling"); for (bad in listOf("Log.", "println", "Toast", "SavedState", "SharedPreferences", "createPeerConnection", "MediaProjection", "claimConsent")) assertFalse(bad, text.contains(bad)) }
 }

@@ -78,11 +78,21 @@ internal class ProtectedRequestSignaling private constructor(
     private var present = false
     private val pending = ArrayDeque<() -> Unit>()
     private var draining = false
+    private var effectsInFlight = 0
     private val ended get() = phase == Phase.CLOSED || phase == Phase.FAILED
-    private fun change(action: () -> Unit) {
+    /** Phase one is bookkeeping only. Even synchronous nested socket callbacks
+     * finish their effects before any consumer drain can begin. */
+    private fun change(action: MutableList<() -> Unit>.() -> Unit) {
+        val effects = mutableListOf<() -> Unit>()
+        synchronized(lock) {
+            effects.action()
+            effectsInFlight += effects.size
+        }
+        for (effect in effects) {
+            try { effect() } finally { synchronized(lock) { effectsInFlight-- } }
+        }
         val start = synchronized(lock) {
-            action()
-            if (!draining && pending.isNotEmpty()) { draining = true; true } else false
+            if (effectsInFlight == 0 && !draining && pending.isNotEmpty()) { draining = true; true } else false
         }
         if (start) dispatch { drain() }
     }
@@ -94,71 +104,89 @@ internal class ProtectedRequestSignaling private constructor(
             try { event() } catch (_: Exception) { /* Consumer errors never expose socket/bearer diagnostics. */ }
         }
     }
-    private fun fail() {
+    /** Called only during phase one; all socket cleanup is a captured external effect. */
+    private fun MutableList<() -> Unit>.terminal(failure: Boolean, local: Boolean = false) {
         if (ended) return
-        phase = Phase.FAILED; bootstrap = null; pending.clear()
-        runCatching { socket?.close(1008); socket?.cancel() }
-        pending.add { events.failed() }
+        phase = if (failure) Phase.FAILED else Phase.CLOSED
+        bootstrap = null; pending.clear()
+        val closing = socket
+        if (failure || local) add {
+            runCatching { closing?.close(if (failure) 1008 else 1000) }
+            if (failure) runCatching { closing?.cancel() }
+        }
+        pending.add { if (failure) events.failed() else events.closed() }
     }
     override fun opened(socket: ProtectedSocket) = change {
-        if (ended) { socket.close(if (phase == Phase.CLOSED) 1000 else 1008); socket.cancel(); return@change }
-        if (phase != Phase.OPENING) { fail(); return@change }
-        this.socket = socket
-        val auth = bootstrap?.consumeAuthFrame(); bootstrap = null
-        if (auth == null || auth.toByteArray(Charsets.UTF_8).size > 512) { fail(); return@change }
-        phase = Phase.AUTH_SENT // Reserve before send, including synchronous fake callbacks.
-        if (!runCatching { socket.send(auth) }.getOrDefault(false)) fail()
-    }
-    override fun text(text: String) = change {
-        if (ended) return@change
-        val m = decode(text) ?: run { fail(); return@change }
-        val type = m.opt("type") as? String ?: run { fail(); return@change }
-        if (phase == Phase.AUTH_SENT) {
-            if (type != "registration" || m.opt("status") != "ok" || m.opt("remotePresence") != false ||
-                m.opt("role") != role.signalingRole || m.opt("intent") != intent.wire ||
-                m.keys().asSequence().toSet() != setOf("type", "status", "role", "intent", "remotePresence")) { fail(); return@change }
-            phase = Phase.REGISTERED; pending.add { events.registered() }; return@change
+        if (ended) {
+            val code = if (phase == Phase.CLOSED) 1000 else 1008
+            add { runCatching { socket.close(code) }; runCatching { socket.cancel() } }; return@change
         }
-        if (phase != Phase.REGISTERED) { fail(); return@change }
-        when (type) {
-            "peer-present" -> {
-                if (m.length() != 1) { fail(); return@change }
-                if (!present) { present = true; pending.add { events.peerPresent() } }
+        if (phase != Phase.OPENING) { terminal(true); return@change }
+        this@ProtectedRequestSignaling.socket = socket
+        val material = bootstrap; bootstrap = null
+        phase = Phase.AUTH_SENT
+        add {
+            val auth = material?.consumeAuthFrame()
+            if (auth == null || auth.toByteArray(Charsets.UTF_8).size > 512) failed()
+            else {
+                val admitted = synchronized(lock) { !ended && this@ProtectedRequestSignaling.socket === socket }
+                if (admitted && !runCatching { socket.send(auth) }.getOrDefault(false)) failed()
             }
-            "peer-left", "bye" -> {
-                if (m.length() != 1) { fail(); return@change }
-                pending.add { events.payload(text) }
-            }
-            "offer", "answer", "ice" -> pending.add { events.payload(text) }
-            else -> fail() // Includes request-auth, duplicate registration and remote presence.
         }
     }
-    fun send(text: String): Boolean {
-        var sent = false
+    override fun text(text: String) {
+        val m = decode(text)
+        val type = m?.opt("type") as? String
         change {
             if (ended) return@change
-            val m = decode(text)
-            val type = m?.opt("type") as? String
-            if (type == "request-auth") { fail(); return@change }
+            if (m == null || type == null) { terminal(true); return@change }
+            if (phase == Phase.AUTH_SENT) {
+                if (type != "registration" || m.opt("status") != "ok" || m.opt("remotePresence") != false ||
+                    m.opt("role") != role.signalingRole || m.opt("intent") != intent.wire ||
+                    m.keys().asSequence().toSet() != setOf("type", "status", "role", "intent", "remotePresence")) { terminal(true); return@change }
+                phase = Phase.REGISTERED; pending.add { events.registered() }; return@change
+            }
+            if (phase != Phase.REGISTERED) { terminal(true); return@change }
+            when (type) {
+                "peer-present" -> {
+                    if (m.length() != 1) { terminal(true); return@change }
+                    if (!present) { present = true; pending.add { events.peerPresent() } }
+                }
+                "peer-left", "bye" -> {
+                    if (m.length() != 1) { terminal(true); return@change }
+                    pending.add { events.payload(text) }
+                }
+                "offer", "answer", "ice" -> pending.add { events.payload(text) }
+                else -> terminal(true) // Includes request-auth, duplicate registration and remote presence.
+            }
+        }
+    }
+    /** Atomic admission, not atomic network delivery: true means the admitted socket
+     * accepted the frame. A later/concurrent terminal transition may still win. */
+    fun send(text: String): Boolean {
+        var sent = false
+        val type = decode(text)?.opt("type") as? String
+        change {
+            if (ended) return@change
+            if (type == "request-auth") { terminal(true); return@change }
             if (phase != Phase.REGISTERED) return@change // No application queue before authentication.
-            if (type !in setOf("offer", "answer", "ice", "peer-left", "bye")) { fail(); return@change }
-            sent = runCatching { socket?.send(text) == true }.getOrDefault(false)
-            if (!sent) fail()
+            if (type !in setOf("offer", "answer", "ice", "peer-left", "bye")) { terminal(true); return@change }
+            val sending = socket
+            add {
+                sent = runCatching { sending?.send(text) == true }.getOrDefault(false)
+                if (!sent) failed()
+            }
         }
         return sent
     }
-    override fun binary() = change { fail() }
-    override fun failed() = change { fail() }
+    override fun binary() = change { terminal(true) }
+    override fun failed() = change { terminal(true) }
     override fun closed(code: Int) = change {
         if (ended) return@change
-        if (code != 1000 || phase != Phase.REGISTERED) fail()
-        else { phase = Phase.CLOSED; bootstrap = null; pending.add { events.closed() } }
+        terminal(code != 1000 || phase != Phase.REGISTERED)
     }
     fun close() = change {
-        if (ended) return@change
-        phase = Phase.CLOSED; bootstrap = null; pending.clear()
-        runCatching { socket?.close(1000) }
-        pending.add { events.closed() }
+        terminal(false, local = true)
     }
     override fun toString() = "ProtectedRequestSignaling[redacted]"
     companion object {
@@ -172,8 +200,11 @@ internal class ProtectedRequestSignaling private constructor(
             val transport = ProtectedRequestSignaling(bootstrap, events, dispatch)
             try {
                 val socket = factory.open(bootstrap.url, transport) // Never under the controller lock.
-                synchronized(transport.lock) {
-                    if (transport.ended) { socket.close(if (transport.phase == Phase.CLOSED) 1000 else 1008); socket.cancel() }
+                transport.change {
+                    if (transport.ended) {
+                        val code = if (transport.phase == Phase.CLOSED) 1000 else 1008
+                        add { runCatching { socket.close(code) }; runCatching { socket.cancel() } }
+                    }
                     else if (transport.socket == null) transport.socket = socket
                 }
             } catch (_: Exception) { transport.failed() }
@@ -183,9 +214,15 @@ internal class ProtectedRequestSignaling private constructor(
 }
 
 /** No logging interceptor and no automatic retry. Constructed only by an explicit future caller. */
-internal class OkHttpProtectedSocketFactory(private val http: OkHttpClient = OkHttpClient.Builder()
-    .retryOnConnectionFailure(false).followRedirects(false).followSslRedirects(false).build()) : ProtectedSocketFactory {
+internal class OkHttpProtectedSocketFactory : ProtectedSocketFactory {
+    private val http = OkHttpClient.Builder().retryOnConnectionFailure(false)
+        .followRedirects(false).followSslRedirects(false).build()
+    internal class Policy(val followRedirects: Boolean, val followSslRedirects: Boolean,
+        val retryOnConnectionFailure: Boolean, val applicationInterceptors: Int, val networkInterceptors: Int)
+    internal fun policy() = Policy(http.followRedirects, http.followSslRedirects, http.retryOnConnectionFailure,
+        http.interceptors.size, http.networkInterceptors.size)
     override fun open(url: String, listener: ProtectedSocketListener): ProtectedSocket {
+        require(runCatching { URI(url).scheme == "wss" }.getOrDefault(false))
         class Adapter : ProtectedSocket {
             lateinit var ws: WebSocket
             override fun send(text: String) = ws.send(text)
