@@ -175,13 +175,14 @@ class RequestMediaTest {
         val factory = Factory(); val q = Queue(); val timers = mutableListOf<Long>(); var generated = 0; var media = 0; var disposed = 0
         val receivedIce = mutableListOf<ReceiverIce>()
         var localIce: ((ReceiverIce) -> Unit)? = null
+        var mediaFailure: (() -> Unit)? = null
         val legacy = object : ReceiverWire {
             override fun open(code: String, intent: PairingIntent, events: ReceiverEvents): PairingLink = error("legacy forbidden")
             override fun answer(sdp: String) = error("legacy forbidden")
             override fun candidate(value: ReceiverIce) = error("legacy forbidden")
         }
         val router = ReceiverWireRouter(legacy)
-        val engine = ReceiverEngine(router, { candidate, _ -> media++; localIce = candidate; object : ReceiverMedia {
+        val engine = ReceiverEngine(router, { candidate, failure -> media++; localIce = candidate; mediaFailure = failure; object : ReceiverMedia {
             override fun offer(sdp: String, remoteReady: () -> Unit, answer: (String) -> Unit, failure: () -> Unit) { remoteReady(); answer("answer") }
             override fun ice(candidate: ReceiverIce) { receivedIce.add(candidate) }
             override fun close() { disposed++ }
@@ -213,9 +214,9 @@ class RequestMediaTest {
         r.factory.listener.text("""{"type":"registration","status":"conflict","intent":"create","role":"receiver","remotePresence":false}"""); r.q.run()
         assertFalse(r.owner.active); assertEquals(1, r.factory.opens); assertEquals(0, r.generated)
     }
-    @Test fun retainedReceiverOwnerSurvivesViewDetachAndRejectsSecondStartOrStaleStop() {
+    @Test fun retainedReceiverOwnerRejectsSecondStartOrStaleStop() {
         val r = ReceiverFixture(); r.start(); r.register()
-        // View recreation has no ownership operation: the retained owner/Engine is reused.
+        // Retained-owner behavior only; actual renderer/Activity recreation is pending B4E/device testing.
         val retained = r.owner
         assertSame(retained, r.owner); assertTrue(retained.active)
         assertFalse(retained.start("another")); assertFalse(retained.stop(Any())); assertEquals(1, r.factory.opens)
@@ -306,5 +307,188 @@ class RequestMediaTest {
         val redemption = f.handoffs.consume(id, MediaRole.SEND)!!
         assertEquals("RequestMediaOwner[redacted]", redemption.owner.toString())
         assertEquals("RequestMediaRedemption[redacted]", redemption.toString())
+    }
+    private fun cleanup(f: Fixture, id: RequestMediaHandoffId?, legacy: (Long) -> Unit = { error("legacy forbidden") }) =
+        SenderStartCleanup(SenderStartMode.REQUEST, id?.value, 7, f.handoffs::abandon, f.handoffs::disposed, legacy)
+
+    @Test fun requestPreValidationFailuresAbandonAndAllowSameFlowRetryWithoutHttpExit() {
+        for (failure in listOf("missing consent", "invalid consent object", "wrong role", "forbidden legacy extras")) {
+            val f = Fixture(); val flow = f.initiator(); val id = f.handoffs.reserve(flow, MediaRole.SEND)!!
+            var abandons = 0
+            val cleanup = SenderStartCleanup(SenderStartMode.REQUEST, id.value, 7,
+                { abandons++; f.handoffs.abandon(it) }, f.handoffs::disposed, { error("legacy forbidden") })
+            // Same boundary as service: cleanup authority is captured before fallible reads/validation.
+            try { error(failure) } catch (_: Exception) { cleanup.disposeRequest(); cleanup.retireLegacy() }
+            cleanup.disposeRequest(); cleanup.retireLegacy()
+            assertEquals(1, abandons)
+            assertNull(f.handoffs.consume(id, MediaRole.SEND))
+            assertNull(f.controller.mediaPhaseForFlow(flow))
+            assertNotNull(f.handoffs.reserve(flow, MediaRole.SEND))
+            assertEquals(0, f.cancels); assertEquals(0, f.withdraws)
+            assertSame(flow, f.controller.setupSnapshot()!!.flow)
+        }
+    }
+    @Test fun unknownMalformedConsumedAndMissingIdsAreHarmless() {
+        val f = Fixture(); val flow = f.initiator(); val id = f.handoffs.reserve(flow, MediaRole.SEND)!!
+        for (bad in listOf(null, "", "not-a-token", "unknown")) {
+            SenderStartCleanup(SenderStartMode.REQUEST, bad, 9, f.handoffs::abandon, f.handoffs::disposed,
+                { error("legacy forbidden") }).disposeRequest()
+        }
+        val redemption = f.handoffs.consume(id, MediaRole.SEND)!!
+        f.handoffs.abandon(id.value) // Consumed ID must not dispose the active owner.
+        assertEquals(RequestMediaPhase.STARTED, f.controller.mediaPhase(redemption.owner))
+    }
+    @Test fun requestRedeemedCleanupAcknowledgesOnceInsteadOfAbandoning() {
+        val f = Fixture(); val flow = f.initiator(); val id = f.handoffs.reserve(flow, MediaRole.SEND)!!
+        var abandons = 0; var acknowledgements = 0
+        val cleanup = SenderStartCleanup(SenderStartMode.REQUEST, id.value, 9,
+            { abandons++; f.handoffs.abandon(it) }, { acknowledgements++; f.handoffs.disposed(it) }, { error("legacy forbidden") })
+        cleanup.redeemed(f.handoffs.consume(id, MediaRole.SEND)!!.owner)
+        repeat(5) { cleanup.disposeRequest(); cleanup.retireLegacy() }
+        assertEquals(0, abandons); assertEquals(1, acknowledgements)
+        assertEquals(RequestMediaPhase.DISPOSED, f.controller.mediaPhaseForFlow(flow))
+    }
+    @Test fun staleEarlyAbandonCannotTouchNewReservation() {
+        val f = Fixture(); val a = f.initiator(); val old = f.handoffs.reserve(a, MediaRole.SEND)!!
+        val cleanup = cleanup(f, old); val b = f.initiator(); val fresh = f.handoffs.reserve(b, MediaRole.SEND)!!
+        cleanup.disposeRequest(); cleanup.disposeRequest()
+        assertEquals(RequestMediaPhase.RESERVED, f.controller.mediaPhaseForFlow(b))
+        assertSame(b, f.handoffs.consume(fresh, MediaRole.SEND)!!.owner.flow)
+    }
+    @Test fun legacyMissingConsentAndInvalidSessionRetireCapturedEpochOnce() {
+        for (failure in listOf("missing consent", "invalid session", "wrong role")) {
+            val retired = mutableListOf<Long>()
+            val cleanup = SenderStartCleanup(SenderStartMode.LEGACY, "ignored-request-id", 17,
+                { error("request forbidden") }, { error("request forbidden") }, retired::add)
+            try { error(failure) } catch (_: Exception) { cleanup.disposeRequest(); cleanup.retireLegacy() }
+            repeat(3) { cleanup.disposeRequest(); cleanup.retireLegacy() }
+            assertEquals(listOf(17L), retired)
+        }
+    }
+    @Test fun legacyChannelTakesExactlyOnceRetirementOwnership() {
+        var fallback = 0; var channelDisposals = 0
+        val cleanup = SenderStartCleanup(SenderStartMode.LEGACY, null, 17,
+            { error("request forbidden") }, { error("request forbidden") }, { fallback++ })
+        cleanup.legacyChannel(object : SenderSignalingChannel {
+            override fun open(events: SenderSignalingEvents) {}
+            override fun send(text: String) = true
+            override fun close() {}
+            override fun disposed() { channelDisposals++ }
+        })
+        repeat(4) { cleanup.disposeRequest(); cleanup.retireLegacy() }
+        assertEquals(1, channelDisposals); assertEquals(0, fallback)
+    }
+    @Test fun staleLegacyRetirementUsesAutoPairingEpochGuard() {
+        val timers = mutableListOf<() -> Unit>()
+        val host = AutoPairing(object : PairingTransport {
+            override fun open(code: String, intent: PairingIntent, message: (String, String, String) -> Unit, ended: () -> Unit) =
+                object : PairingLink { override fun send(text: String) = true; override fun close() {} }
+        }, { _, action -> timers.add(action); {} }, {}, { "ABC234" })
+        host.show(); val a = host.home.epoch
+        val cleanup = SenderStartCleanup(SenderStartMode.LEGACY, null, a,
+            { error("request forbidden") }, { error("request forbidden") }, host::mediaStopped)
+        host.close(); host.show(); val b = host.home
+        cleanup.retireLegacy(); assertEquals(b, host.home)
+    }
+    @Test fun reservedThenExitBeforeRedeemNeverOpensSocket() {
+        val f = Fixture(); val flow = f.initiator(); val id = f.handoffs.reserve(flow, MediaRole.SEND)!!
+        assertTrue(f.controller.requestMediaExit(flow)) // HTTP deliberately still queued.
+        assertNull(f.handoffs.consume(id, MediaRole.SEND))
+        assertNull(f.controller.protectedSignalingBootstrap(flow))
+        assertEquals(RequestMediaPhase.DISPOSED, f.controller.mediaPhaseForFlow(flow))
+    }
+    @Test fun runningSenderLateDisposalCannotAckNewStartedOwner() {
+        val f = Fixture(); val a = f.initiator(); val id = f.handoffs.reserve(a, MediaRole.SEND)!!
+        val cleanup = cleanup(f, id); val redemption = f.handoffs.consume(id, MediaRole.SEND)!!; cleanup.redeemed(redemption.owner)
+        val factory = Factory(); val q = Queue()
+        ProtectedSenderSignalingChannel(redemption.bootstrap, factory, q::dispatch).open(object : SenderSignalingEvents {
+            override fun registered() {}; override fun peerPresent() {}; override fun payload(text: String) {}
+            override fun ended() { cleanup.disposeRequest(); cleanup.retireLegacy() }
+        })
+        factory.register(MediaRole.SEND, PairingIntent.CREATE); q.run()
+        // Explicit local context replacement, not create() bypass of the live-owner guard.
+        f.controller.clear(); val b = f.initiator(); val bid = f.handoffs.reserve(b, MediaRole.SEND)!!
+        val bOwner = f.handoffs.consume(bid, MediaRole.SEND)!!.owner; val state = f.controller.state.value
+        factory.listener.failed(); q.run(); cleanup.disposeRequest()
+        assertEquals(RequestMediaPhase.DISPOSED, f.controller.mediaPhase(redemption.owner))
+        assertEquals(RequestMediaPhase.STARTED, f.controller.mediaPhase(bOwner)); assertEquals(state, f.controller.state.value)
+    }
+    @Test fun concurrentScopedCancelsAdmitOnlyOneHttpOperation() {
+        val f = Fixture(); val flow = f.initiator(); val start = CountDownLatch(1); val admitted = AtomicInteger()
+        val threads = List(2) { Thread { start.await(); if (f.controller.cancelInitiator(flow)) admitted.incrementAndGet() } }
+        threads.forEach(Thread::start); start.countDown(); threads.forEach { it.join(2000); assertFalse(it.isAlive) }
+        assertEquals(1, admitted.get()); f.worker.run(); assertEquals(1, f.cancels)
+    }
+    @Test fun receiverExitWinsBeforeStartForInitiatorAndRecipient() {
+        for (recipient in listOf(false, true)) {
+            val r = ReceiverFixture(recipient); val id = r.f.handoffs.reserve(r.flow, MediaRole.RECEIVE)!!
+            assertTrue(r.f.controller.requestMediaExit(r.flow))
+            assertFalse(r.owner.start(id)); assertEquals(0, r.factory.opens); assertEquals(0, r.media)
+        }
+    }
+    @Test fun receiverStartWinsThenScopedStopAndFailedExitNeverRestart() {
+        for (recipient in listOf(false, true)) {
+            val r = ReceiverFixture(recipient); r.start(); r.register()
+            assertFalse(r.f.controller.requestMediaExit(r.flow)) // Live owner must be stopped first.
+            assertTrue(r.owner.stop(r.flow)); r.f.exitError = ConnectionRequestError.NETWORK
+            assertTrue(r.f.controller.requestMediaExit(r.flow)); r.f.worker.run()
+            assertNull(r.f.handoffs.reserve(r.flow, MediaRole.RECEIVE)); assertFalse(r.owner.active)
+            assertEquals(1, r.factory.opens); assertEquals(0, r.generated)
+        }
+    }
+    @Test fun connectedReceiverSocketFailureBeforeMediaNeverReconnectsOrExitsHttp() {
+        val r = ReceiverFixture(); r.start(); r.register()
+        r.f.server = ConnectionRequestState.CONNECTED; r.f.controller.refreshStatus(); r.f.worker.run()
+        r.factory.listener.failed(); r.q.run()
+        assertFalse(r.owner.active); assertEquals(0, r.media); assertEquals(0, r.generated)
+        assertEquals(1, r.factory.opens); assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+        assertNull(r.f.controller.protectedSignalingBootstrap(r.flow as ConnectionRequestCreateAttempt))
+    }
+    @Test fun connectedReceiverMediaFailureOnlyDisposesMedia() {
+        val r = ReceiverFixture(true); r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"offer"}"""); r.q.run()
+        r.f.server = ConnectionRequestState.CONNECTED; r.f.controller.refreshStatus(); r.f.worker.run()
+        r.mediaFailure!!(); r.q.run()
+        assertEquals(1, r.disposed); assertFalse(r.owner.active); assertEquals(0, r.generated)
+        assertEquals(0, r.f.withdraws); assertEquals(0, r.f.cancels); assertEquals(1, r.factory.opens)
+        assertNull(r.f.handoffs.reserve(r.flow, MediaRole.RECEIVE))
+    }
+    @Test fun connectedSenderFailureNeverRetiresLegacyOrSendsHttpExit() {
+        val f = Fixture(); val a = f.initiator(); val id = f.handoffs.reserve(a, MediaRole.SEND)!!
+        var legacy = 0; val cleanup = cleanup(f, id) { legacy++ }
+        val redemption = f.handoffs.consume(id, MediaRole.SEND)!!; cleanup.redeemed(redemption.owner)
+        val q = Queue(); val factory = Factory()
+        ProtectedSenderSignalingChannel(redemption.bootstrap, factory, q::dispatch).open(object : SenderSignalingEvents {
+            override fun registered() {}; override fun peerPresent() {}; override fun payload(text: String) {}
+            override fun ended() { cleanup.disposeRequest(); cleanup.retireLegacy() }
+        })
+        factory.register(MediaRole.SEND, PairingIntent.CREATE); q.run()
+        f.server = ConnectionRequestState.CONNECTED; f.controller.refreshStatus(); f.worker.run()
+        factory.listener.failed(); q.run()
+        assertEquals(0, legacy); assertEquals(0, f.cancels); assertEquals(0, f.withdraws)
+        assertEquals(1, factory.opens); assertNull(f.controller.protectedSignalingBootstrap(a))
+        assertEquals(RequestMediaPhase.DISPOSED, f.controller.mediaPhase(redemption.owner))
+    }
+    @Test fun captureFailureBeforeRedemptionReleasesReservationForRetry() {
+        val f = Fixture(); val a = f.initiator(); val id = f.handoffs.reserve(a, MediaRole.SEND)!!
+        val cleanup = cleanup(f, id); var redeem = 0; var opens = 0
+        try {
+            captureBeforeRequestSignaling({ error("capture failed") }, {
+                redeem++; f.handoffs.consume(checkNotNull(cleanup.handoffId), MediaRole.SEND)
+            }) { opens++ }
+        } catch (_: Exception) { cleanup.disposeRequest() }
+        assertEquals(0, redeem); assertEquals(0, opens)
+        assertNotNull(f.handoffs.reserve(a, MediaRole.SEND)); assertEquals(0, f.cancels)
+    }
+    @Test fun serviceCapturesCleanupBeforeAnyFallibleValidation() {
+        // Wiring audit supplements the behavior tests above; no Android test framework is introduced.
+        val source = java.io.File("src/main/java/com/pradertamas/uicapturetest/WebRtcService.kt").readText()
+        val captured = source.indexOf("startCleanup = SenderStartCleanup(")
+        assertTrue(captured >= 0)
+        assertTrue(captured < source.indexOf("val consent = intent.getParcelableExtra"))
+        assertTrue(captured < source.indexOf("check(AppMediaRoles.role == MediaRole.SEND"))
+        assertTrue(captured < source.indexOf("check(PairingCode.normalize(session) == session)"))
+        assertTrue(source.contains("startCleanup?.disposeRequest()"))
+        assertTrue(source.contains("startCleanup?.retireLegacy()"))
     }
 }

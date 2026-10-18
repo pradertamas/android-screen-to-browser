@@ -56,8 +56,7 @@ class WebRtcService : Service() {
     private var registration: PairingRegistration? = null
     private var mode = SenderStartMode.LEGACY
     private var channel: SenderSignalingChannel? = null
-    private var requestHandoff: String? = null
-    private var requestOwner: RequestMediaOwner? = null
+    private var startCleanup: SenderStartCleanup? = null
     private var pairingIntent = PairingIntent.CREATE
     private var registered = false
     private var userStatus = "Connecting"
@@ -99,20 +98,30 @@ class WebRtcService : Service() {
         if (intent?.action == STOP) { handler.post { finish("Stopped") }; return START_NOT_STICKY }
         if (intent?.action != START || started) { if (!started) stopSelf(); return START_NOT_STICKY }
         started = true
-        val consent = intent.getParcelableExtra(CONSENT, Intent::class.java)
-        val session = intent.getStringExtra(SESSION).orEmpty()
-        pairingEpoch = intent.getLongExtra(EPOCH, -1L)
+        // Capture only local cleanup selectors BEFORE any fallible validation/consent read.
+        val requestedMode = runCatching { SenderStartMode.valueOf(intent.getStringExtra(MODE) ?: "LEGACY") }.getOrNull()
+        val handoff = if (requestedMode == SenderStartMode.REQUEST)
+            runCatching { intent.getStringExtra(HANDOFF) }.getOrNull() else null
+        pairingEpoch = if (requestedMode == SenderStartMode.LEGACY)
+            runCatching { intent.getLongExtra(EPOCH, -1L) }.getOrDefault(-1L) else -1L
+        startCleanup = SenderStartCleanup(requestedMode, handoff, pairingEpoch,
+            { ConnectionRequestMediaHandoff.process.abandon(it) },
+            { ConnectionRequestMediaHandoff.process.disposed(it) },
+            { epoch -> LegacySenderSignalingChannel(epoch, dispatch = { action -> handler.post { action() } }).disposed() })
         try {
+            mode = checkNotNull(requestedMode)
+            val consent = intent.getParcelableExtra(CONSENT, Intent::class.java)
+            val session = intent.getStringExtra(SESSION).orEmpty()
             check(AppMediaRoles.role == MediaRole.SEND && MediaRole.SEND.captureAllowed)
-            mode = SenderStartMode.valueOf(intent.getStringExtra(MODE) ?: "LEGACY")
             check(consent != null)
             if (mode == SenderStartMode.LEGACY) {
                 pairingIntent = PairingIntent.valueOf(intent.getStringExtra(INTENT) ?: "CREATE")
                 check(LegacySenderSignalingChannel.current(pairingEpoch))
                 check(PairingCode.normalize(session) == session)
                 channel = LegacySenderSignalingChannel(pairingEpoch, dispatch = { action -> handler.post { action() } })
+                startCleanup?.legacyChannel(checkNotNull(channel))
             } else {
-                requestHandoff = checkNotNull(intent.getStringExtra(HANDOFF))
+                checkNotNull(startCleanup?.handoffId)
                 check(!intent.hasExtra(SESSION) && !intent.hasExtra(INTENT) && !intent.hasExtra(EPOCH))
                 WebRtcState.set(WebRtcUi(busy = true, status = "Connecting"))
             }
@@ -133,9 +142,9 @@ class WebRtcService : Service() {
         if (closing) return
         if (mode == SenderStartMode.REQUEST) {
             captureBeforeRequestSignaling({ initializeCapture(consent); check(!projectionEnded.get()) }, {
-                ConnectionRequestMediaHandoff.process.consume(checkNotNull(requestHandoff), MediaRole.SEND)
+                ConnectionRequestMediaHandoff.process.consume(checkNotNull(startCleanup?.handoffId), MediaRole.SEND)
             }) { redemption ->
-                requestOwner = redemption.owner
+                checkNotNull(startCleanup).redeemed(redemption.owner)
                 pairingIntent = redemption.bootstrap.intent
                 channel = ProtectedSenderSignalingChannel(redemption.bootstrap, dispatch = { action -> handler.post { action() } })
                 openSignaling()
@@ -375,15 +384,14 @@ class WebRtcService : Service() {
         factory?.dispose(); factory = null
         egl?.release(); egl = null
         pendingIce.clear()
-        requestOwner?.let(ConnectionRequestMediaHandoff.process::disposed)
-        requestHandoff?.let { ConnectionRequestMediaHandoff.process.abandon(it) }
+        startCleanup?.disposeRequest()
         WebRtcState.set(WebRtcUi(true, reason, snapshot))
         stopForeground(STOP_FOREGROUND_REMOVE)
         if (destroyed) releaseControlThread() else stopSelf()
     }
     private fun releaseControlThread() {
         WebRtcState.set(WebRtcState.state.value.copy(busy = false))
-        channel?.disposed()
+        startCleanup?.retireLegacy()
         thread.quitSafely()
     }
     override fun onDestroy() {

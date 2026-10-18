@@ -218,6 +218,13 @@ class ConnectionRequestController(
         owner.phase = RequestMediaPhase.STARTED
         bootstrap
     }
+    /** Pre-redemption local failure is not a media exit. Only detach this exact reservation. */
+    internal fun abandonReservedMedia(owner: RequestMediaOwner) = synchronized(lock) {
+        if (owner.phase != RequestMediaPhase.RESERVED) return@synchronized
+        owner.phase = RequestMediaPhase.DISPOSED
+        val c = context
+        if (matches(c, owner.flow) && c?.mediaOwner === owner && !c.exitRequested) c.mediaOwner = null
+    }
     internal fun mediaDisposed(owner: RequestMediaOwner) = synchronized(lock) {
         owner.phase = RequestMediaPhase.DISPOSED
         // A failed/stopped media owner must never be automatically restarted for this flow.

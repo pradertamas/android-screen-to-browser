@@ -30,7 +30,8 @@ protected URL crosses that Intent boundary.
 REQUEST startup is foreground service -> existing capture initialization -> track
 created and projection not stopped -> handoff redemption -> fresh exact-flow
 bootstrap -> protected socket open/auth. Capture failure prevents redemption/open;
-service disposal abandons an outstanding reservation. Protected registered only
+service disposal abandons an outstanding reservation, including failures before
+consent/role/session validation. Protected registered only
 marks local signaling readiness. Only REAL protected peer-present invokes the
 existing createPeerAndOffer path. No synthetic presence, PairingHost callback,
 code regeneration or downgrade exists on this path. Request pairingCode is empty
@@ -52,6 +53,32 @@ Owner state is RESERVED -> STARTED -> DISPOSED under the controller lock. A live
 STARTED media owner prevents initiator context replacement until local disposal.
 Stale disposal can update its own acknowledgement but cannot pause/modify B.
 Process death loses all handoffs and ownership; there is no persistence/recovery.
+
+### FIX1 — early start cleanup ownership
+
+At service START entry, recognized REQUEST mode captures the opaque handoff key;
+LEGACY/default mode captures its epoch. This happens before the consent object is
+read or app role, session and forbidden extras are validated. Missing/invalid
+consent, wrong role and forbidden legacy extras therefore retain exact cleanup
+authority even when a signaling channel is never constructed. Missing, malformed,
+unknown or already-consumed handoff keys are harmless no-ops during abandon.
+
+SenderStartCleanup distinguishes a still-RESERVED key from a redeemed media owner.
+Pre-redemption abandon removes only that key. Under the controller lock it marks
+only that reserved owner disposed and detaches the matching reservation, allowing
+a new reservation for the same current flow. It does NOT set exitRequested and
+does NOT send HTTP cancel/withdraw. An already-requested exit remains in force.
+Redeemed owners continue through media disposal acknowledgement and cannot restart
+that flow. Abandon of a consumed key never acknowledges the started owner.
+
+LEGACY pre-channel failure still invokes epoch-scoped mediaStopped via the legacy
+adapter's disposal hook, matching the behavior before B4D. Once a channel exists,
+it takes over that disposal hook. The once-only cleanup owner chooses either
+fallback retirement or channel disposal, never both. Request cleanup never invokes
+legacy hooks; legacy cleanup never invokes the registry/controller. Teardown and
+destroy can repeat without another abandon/ack/retirement. Stale epoch cleanup is
+still rejected by AutoPairing's existing epoch guard. No PairingHost refactor,
+protected transport change, Activity wiring or media algorithm change is involved.
 
 ## Receiver
 
@@ -110,6 +137,13 @@ stale handoffs, capture-before-auth sequencing, real peer gating, request receiv
 policies, retained owner reuse, scoped exits, lost-response retry and CONNECTED
 reconciliation. Native capture, foreground service and renderer recreation still
 require device testing; JVM retained-owner tests do not claim a device rotation test.
+Activity-level rotation / renderer detach-reattach validation: PENDING FOR B4E / PHYSICAL.
+FIX1 adds controlled start/exit ordering, concurrent cancel admission, actual
+STARTED A -> explicit context replacement B -> late A acknowledgement, and
+CONNECTED socket/media failure tests. They assert no reconnect, HTTP exit or
+legacy restart. Native Service/MediaProjection behavior is still device-dependent;
+the JVM startup tests exercise the production cleanup owner and sequencing helper,
+with a supplementary source wiring audit rather than a simulated Android runtime.
 
 PHYSICAL /connect DOMAIN VERIFICATION: PENDING — second Android device unavailable.
 Physical request media end-to-end is pending B4E wiring and device testing.

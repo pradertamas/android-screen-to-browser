@@ -30,11 +30,46 @@ internal class ConnectionRequestMediaHandoff(private val controller: ConnectionR
         if (bootstrap == null) { controller.mediaDisposed(owner); return null }
         return RequestMediaRedemption(owner, bootstrap)
     }
-    fun abandon(id: String) { synchronized(entries) { entries.remove(id) }?.let(controller::mediaDisposed) }
+    fun abandon(id: String) { synchronized(entries) { entries.remove(id) }?.let(controller::abandonReservedMedia) }
     fun disposed(owner: RequestMediaOwner) = controller.mediaDisposed(owner)
     companion object {
         val process by lazy { ConnectionRequestMediaHandoff(ConnectionRequests.controller) }
     }
+}
+
+/** Service-start cleanup authority is captured before consent/role/session validation.
+ * All subsequent calls belong to the service control thread. Reserved and redeemed
+ * resources have distinct cleanup paths; legacy retirement remains at service disposal.
+ * No credentials, Android objects, HTTP or media operations are stored here. */
+internal class SenderStartCleanup(private val mode: SenderStartMode?, handoff: String?, epoch: Long,
+    private val abandon: (String) -> Unit, private val disposed: (RequestMediaOwner) -> Unit,
+    retireLegacy: (Long) -> Unit) {
+    var handoffId: String? = if (mode == SenderStartMode.REQUEST) handoff else null; private set
+    private var owner: RequestMediaOwner? = null
+    private var requestDone = false
+    private var legacyDone = false
+    private var legacyDisposal: () -> Unit = { retireLegacy(epoch) }
+    fun redeemed(value: RequestMediaOwner) {
+        check(mode == SenderStartMode.REQUEST && !requestDone && owner == null)
+        owner = value; handoffId = null
+    }
+    fun legacyChannel(channel: SenderSignalingChannel) {
+        check(mode == SenderStartMode.LEGACY && !legacyDone)
+        legacyDisposal = channel::disposed
+    }
+    fun disposeRequest() {
+        if (mode != SenderStartMode.REQUEST || requestDone) return
+        requestDone = true
+        val started = owner; owner = null
+        val reserved = handoffId; handoffId = null
+        if (started != null) disposed(started) else reserved?.let(abandon)
+    }
+    fun retireLegacy() {
+        if (mode != SenderStartMode.LEGACY || legacyDone) return
+        legacyDone = true
+        legacyDisposal()
+    }
+    override fun toString() = "SenderStartCleanup[redacted]"
 }
 
 /** Shared by the service and deterministic tests: capture must succeed before any authority export. */
