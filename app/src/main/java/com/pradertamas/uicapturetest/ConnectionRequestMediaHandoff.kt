@@ -17,7 +17,8 @@ internal class RequestMediaRedemption(val owner: RequestMediaOwner, val bootstra
 /** Process-only, one-shot mailbox. Only its random key may cross a service Intent boundary.
  * No precomputed bearer bootstrap is cached. The controller revalidates exact flow at redemption.
  * Mailbox lock is never held while entering the controller authority lock. */
-internal class ConnectionRequestMediaHandoff(private val controller: ConnectionRequestController) {
+internal class ConnectionRequestMediaHandoff(private val controller: ConnectionRequestController,
+    private val abandoned: (Any) -> Unit = {}) {
     private val entries = mutableMapOf<String, RequestMediaOwner>()
     fun reserve(flow: Any, role: MediaRole): RequestMediaHandoffId? {
         val owner = controller.reserveMedia(flow, role) ?: return null
@@ -30,10 +31,20 @@ internal class ConnectionRequestMediaHandoff(private val controller: ConnectionR
         if (bootstrap == null) { controller.mediaDisposed(owner); return null }
         return RequestMediaRedemption(owner, bootstrap)
     }
-    fun abandon(id: String) { synchronized(entries) { entries.remove(id) }?.let(controller::abandonReservedMedia) }
+    fun abandon(id: String) {
+        val owner = synchronized(entries) { entries.remove(id) } ?: return
+        controller.abandonReservedMedia(owner)
+        abandoned(owner.flow) // Policy notification outside mailbox/controller locks.
+    }
     fun disposed(owner: RequestMediaOwner) = controller.mediaDisposed(owner)
+    fun flowFor(id: String): Any? = synchronized(entries) { entries[id]?.flow }
+    fun reject(id: String, exit: (Any) -> Unit) {
+        val owner = synchronized(entries) { entries.remove(id) } ?: return
+        controller.abandonReservedMedia(owner)
+        exit(owner.flow)
+    }
     companion object {
-        val process by lazy { ConnectionRequestMediaHandoff(ConnectionRequests.controller) }
+        val process by lazy { ConnectionRequestMediaHandoff(ConnectionRequests.controller, RequestMediaLifecycle::localStartFailed) }
     }
 }
 

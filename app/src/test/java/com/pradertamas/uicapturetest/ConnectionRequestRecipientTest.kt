@@ -332,7 +332,10 @@ class ConnectionRequestRecipientTest {
     @Test fun flowHandleIsNeverSavedOrPublishedByActivity() {
         val activity = source("ConnectionRequestActivity"); val model = source("ConnectionRequestActivityViewModel")
         assertFalse(activity.contains("putBoolean")); assertFalse(activity.contains("onSaveInstanceState")); assertFalse(activity.contains("recipientOwner"))
-        for (text in listOf(activity, model)) for (forbidden in listOf("SavedStateHandle", "rememberSaveable", "putExtra", "SharedPreferences", "DataStore")) assertFalse(text.contains(forbidden))
+        for (text in listOf(activity, model)) for (forbidden in listOf("SavedStateHandle", "rememberSaveable", "SharedPreferences", "DataStore")) assertFalse(text.contains(forbidden))
+        // B4E permits only an opaque one-shot media handoff in navigation, never the flow/bearer.
+        assertEquals(1, Regex("\\.putExtra\\(").findAll(activity).count())
+        assertTrue(activity.contains("putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value)"))
         assertTrue(activity.contains("coordinator.observe(flow)")); assertTrue(activity.contains("coordinator.close(flow)"))
     }
     private fun source(name: String) = listOf(File("src/main/java/com/pradertamas/uicapturetest/$name.kt"), File("app/src/main/java/com/pradertamas/uicapturetest/$name.kt")).first { it.isFile }.readText()

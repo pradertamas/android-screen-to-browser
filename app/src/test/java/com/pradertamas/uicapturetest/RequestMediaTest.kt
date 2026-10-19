@@ -491,4 +491,196 @@ class RequestMediaTest {
         assertTrue(source.contains("startCleanup?.disposeRequest()"))
         assertTrue(source.contains("startCleanup?.retireLegacy()"))
     }
+    @Test fun senderConsentRetainedResumeAndResultAreOneShotForBothSides() {
+        for (recipient in listOf(false, true)) {
+            val f = Fixture(); val flow: Any = if (recipient) f.recipient(MediaRole.SEND) else f.initiator()
+            val lifecycle = ConnectionRequestMediaLifecycle(f.controller) { error("live media cannot release") }
+            val retained = RequestSenderLaunch(f.controller, f.handoffs, lifecycle::requestExit)
+            var prompts = 0; var services = 0; var sent: RequestMediaHandoffId? = null
+            assertTrue(retained.begin(flow, true, MediaRole.SEND, true) { prompts++ })
+            repeat(5) { assertFalse(retained.begin(flow, true, MediaRole.SEND, true) { prompts++ }) }
+            assertTrue(retained.consentPromptInFlight)
+            assertEquals(RequestLaunchResult.TRANSFERRED, retained.result(true, MediaRole.SEND, true) { services++; sent = it })
+            assertEquals(RequestLaunchResult.IGNORED, retained.result(true, MediaRole.SEND, true) { services++ })
+            retained.cancel() // Source Activity/ViewModel removal after transfer cannot abandon/exit.
+            assertEquals(1, prompts); assertEquals(1, services)
+            assertNotNull(f.handoffs.consume(sent!!, MediaRole.SEND)); assertEquals(0, f.cancels); assertEquals(0, f.withdraws)
+        }
+    }
+    @Test fun senderConsentRequiresResumedRoleGateAndConnecting() {
+        val f = Fixture(); val flow = f.initiator(); val launch = RequestSenderLaunch(f.controller, f.handoffs) {}
+        assertFalse(launch.begin(flow, false, MediaRole.SEND, true) { error("prompt") })
+        assertFalse(launch.begin(flow, true, MediaRole.RECEIVE, true) { error("prompt") })
+        assertFalse(launch.begin(flow, true, MediaRole.SEND, false) { error("prompt") })
+        f.server = ConnectionRequestState.CONNECTED; f.controller.refreshStatus(); f.worker.run()
+        assertFalse(launch.begin(flow, true, MediaRole.SEND, true) { error("prompt") })
+    }
+    @Test fun consentCancelUsesExactSideExitAndFinalizesWithoutMediaOwner() {
+        for (recipient in listOf(false, true)) {
+            val f = Fixture(); val flow: Any = if (recipient) f.recipient(MediaRole.SEND) else f.initiator()
+            var releases = 0; val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+            val launch = RequestSenderLaunch(f.controller, f.handoffs, life::requestExit)
+            launch.begin(flow, true, MediaRole.SEND, true) {}
+            assertEquals(RequestLaunchResult.CLOSED, launch.result(false, MediaRole.SEND, true) { error("service") })
+            f.worker.run(); life.changed()
+            assertEquals(if (recipient) 0 else 1, f.cancels); assertEquals(if (recipient) 1 else 0, f.withdraws)
+            assertEquals(1, releases); assertNull(f.controller.mediaSnapshot())
+        }
+    }
+    @Test fun consentLaunchAndServiceExceptionsHaveCleanupAndExplicitNetworkRetry() {
+        for (promptThrows in listOf(true, false)) {
+            val f = Fixture(); val flow = f.initiator(); f.exitError = ConnectionRequestError.NETWORK
+            var releases = 0; val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+            val launch = RequestSenderLaunch(f.controller, f.handoffs, life::requestExit)
+            launch.begin(flow, true, MediaRole.SEND, true) { if (promptThrows) error("platform") }
+            if (!promptThrows) assertEquals(RequestLaunchResult.CLOSED, launch.result(true, MediaRole.SEND, true) { error("service") })
+            f.worker.run(); repeat(4) { life.changed() }
+            assertEquals(1, f.cancels); assertTrue(life.state.value.retry); assertEquals(0, releases)
+            assertSame(flow, f.controller.mediaSnapshot()!!.flow); assertTrue(f.controller.mediaSnapshot()!!.exitRequested)
+            assertNull(f.handoffs.reserve(flow, MediaRole.SEND))
+            f.exitError = null; life.retry(flow); f.worker.run(); life.changed()
+            assertEquals(2, f.cancels); assertEquals(1, releases)
+        }
+    }
+    @Test fun staleConsentResultCannotStartServiceOrExitReplacement() {
+        val f = Fixture(); val a = f.initiator(); var exits = 0
+        val launch = RequestSenderLaunch(f.controller, f.handoffs) { exits++ }
+        launch.begin(a, true, MediaRole.SEND, true) {}
+        val b = f.initiator(); val before = f.controller.state.value
+        assertEquals(RequestLaunchResult.IGNORED, launch.result(true, MediaRole.SEND, true) { error("service") })
+        assertEquals(before, f.controller.state.value); assertEquals(0, exits)
+        assertNotNull(f.handoffs.reserve(b, MediaRole.SEND))
+    }
+    @Test fun receiverEntryNavigationUsesExactOneShotTokenForRecipient() {
+        val r = ReceiverFixture(true); var navigations = 0; var delivered: RequestMediaHandoffId? = null
+        val life = ConnectionRequestMediaLifecycle(r.f.controller) {}
+        assertTrue(startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.RECEIVE, true, life::requestExit) {
+            navigations++; delivered = it; true
+        })
+        assertFalse(startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.RECEIVE, true, life::requestExit) { error("duplicate") })
+        assertTrue(r.owner.start(delivered!!)); assertFalse(r.owner.start(delivered!!))
+        assertEquals(1, navigations); assertEquals(1, r.factory.opens); assertEquals(0, r.f.withdraws)
+    }
+    @Test fun initiatorReceiverStartsWithoutNavigationAndRepeatedEventsAreInert() {
+        val r = ReceiverFixture(); val life = ConnectionRequestMediaLifecycle(r.f.controller) {}
+        repeat(4) { startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.RECEIVE, true, life::requestExit) { r.owner.start(it) } }
+        assertEquals(1, r.factory.opens); assertEquals(0, r.generated)
+    }
+    @Test fun receiverNavigationFailureAbandonsAndWithdrawsExactRecipient() {
+        val f = Fixture(); val flow = f.recipient(); var release = 0
+        val life = ConnectionRequestMediaLifecycle(f.controller) { release++ }
+        assertFalse(startRequestReceiver(f.controller, f.handoffs, flow, true, MediaRole.RECEIVE, true, life::requestExit) { error("navigation") })
+        f.worker.run(); life.changed()
+        assertEquals(1, f.withdraws); assertEquals(1, release)
+    }
+    @Test fun disposedConnectingMediaExitsEachSideThenReleases() {
+        for (recipient in listOf(false, true)) {
+            val r = ReceiverFixture(recipient); var releases = 0
+            val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+            r.start(); life.changed(); assertEquals(0, releases)
+            assertTrue(r.owner.stop(r.flow)); life.changed(); r.f.worker.run(); life.changed()
+            assertEquals(if (recipient) 0 else 1, r.f.cancels); assertEquals(if (recipient) 1 else 0, r.f.withdraws)
+            assertEquals(1, releases); assertNull(r.f.controller.mediaSnapshot())
+        }
+    }
+    @Test fun disposedConnectedMediaFinalizesWithoutHttpAndActiveMediaCannotFinalize() {
+        val r = ReceiverFixture(); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+        r.start(); r.f.server = ConnectionRequestState.CONNECTED; r.f.controller.refreshStatus(); r.f.worker.run()
+        life.changed(); assertFalse(r.f.controller.finishMediaFlow(r.flow) { releases++ })
+        assertEquals(0, releases); assertTrue(r.owner.stop(r.flow)); life.changed()
+        assertEquals(1, releases); assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+    }
+    @Test fun disposedTerminalMediaFinalizesAndStaleFinalizationCannotReleaseB() {
+        for (terminal in listOf(ConnectionRequestState.CANCELED, ConnectionRequestState.EXPIRED, ConnectionRequestState.FAILED)) {
+            val r = ReceiverFixture(); var releases = 0; val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+            r.start(); r.f.server = terminal; r.f.assignment = null; r.f.controller.refreshStatus(); r.f.worker.run()
+            assertFalse(r.f.controller.finishMediaFlow(r.flow) { releases++ })
+            r.owner.stop(r.flow); life.changed(); assertEquals(1, releases)
+            val b = r.f.initiator(); val state = r.f.controller.state.value
+            assertFalse(r.f.controller.finishMediaFlow(r.flow) { releases++ })
+            assertEquals(1, releases); assertEquals(state, r.f.controller.state.value); assertSame(b, r.f.controller.mediaSnapshot()!!.flow)
+        }
+    }
+    @Test fun cleanupConflictReconcilesExactlyOnceToConnectedAndReleases() {
+        val f = Fixture(); val flow = f.initiator(); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+        f.exitError = ConnectionRequestError.CONFLICT; f.onCancel = { f.server = ConnectionRequestState.CONNECTED }
+        life.requestExit(flow); f.worker.run(); life.changed()
+        assertEquals(ConnectionRequestOperation.STATUS, f.controller.state.value.operation)
+        f.worker.run(); life.changed(); repeat(5) { life.changed() }
+        assertEquals(1, f.cancels); assertEquals(1, releases); assertNull(f.controller.mediaSnapshot())
+    }
+    @Test fun staleLifecycleRetryAndExitCannotTouchCurrentFlow() {
+        val f = Fixture(); val a = f.initiator(); f.exitError = ConnectionRequestError.NETWORK
+        val life = ConnectionRequestMediaLifecycle(f.controller) { error("stale release") }
+        life.requestExit(a); f.worker.run(); life.changed(); assertTrue(life.state.value.retry)
+        val b = f.initiator(); val state = f.controller.state.value
+        life.changed(); life.retry(a); life.requestExit(a)
+        assertEquals(state, f.controller.state.value); assertSame(b, f.controller.mediaSnapshot()!!.flow)
+    }
+    @Test fun processAbandonNotificationClosesEarlyServiceFailureWithoutChangingCoreAbandonPolicy() {
+        val f = Fixture(); val flow = f.initiator(); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+        val processLike = ConnectionRequestMediaHandoff(f.controller, life::requestExit)
+        val id = processLike.reserve(flow, MediaRole.SEND)!!
+        processLike.abandon(id.value); f.worker.run(); life.changed()
+        assertEquals(1, f.cancels); assertEquals(1, releases)
+    }
+    @Test fun neverLaunchedSenderViewModelCannotExitReceiverNavigation() {
+        val f = Fixture(); val flow = f.recipient(); var exits = 0
+        val sender = RequestSenderLaunch(f.controller, f.handoffs) { exits++ }
+        assertFalse(sender.begin(flow, true, MediaRole.RECEIVE, true) { error("prompt") })
+        sender.cancel(); assertEquals(0, exits); assertFalse(f.controller.mediaSnapshot()!!.exitRequested)
+    }
+    @Test fun gateCannotFinalizeWaitingAcceptedOrConnectingAndActiveOperationIsGuarded() {
+        val f = Fixture(); val flow = f.controller.create(MediaRole.SEND)!!; f.worker.run(); var releases = 0
+        assertFalse(f.controller.finishMediaFlow(flow) { releases++ }) // WAITING
+        f.server = ConnectionRequestState.ACCEPTED; f.controller.refreshStatus(); f.worker.run()
+        assertFalse(f.controller.finishMediaFlow(flow) { releases++ })
+        f.server = ConnectionRequestState.CONNECTING; f.assignment = ConnectionAssignment("ABC234", MediaRole.SEND, PairingIntent.CREATE)
+        f.controller.refreshStatus(); f.worker.run()
+        assertFalse(f.controller.finishMediaFlow(flow) { releases++ })
+        f.controller.requestMediaExit(flow)
+        assertFalse(f.controller.finishMediaFlow(flow) { releases++ }); assertEquals(0, releases)
+    }
+    @Test fun nonterminalReconciliationRequiresExplicitRetryWithoutLoop() {
+        val f = Fixture(); val flow = f.initiator(); f.exitError = ConnectionRequestError.CONFLICT
+        val life = ConnectionRequestMediaLifecycle(f.controller) { error("cannot release CONNECTING") }
+        life.requestExit(flow); f.worker.run(); life.changed(); f.worker.run(); life.changed()
+        assertTrue(life.state.value.retry)
+        repeat(8) { life.changed() }; assertTrue(f.worker.tasks.isEmpty()); assertEquals(1, f.cancels)
+        life.retry(flow); assertEquals(1, f.worker.tasks.size)
+        f.worker.run(); life.changed(); assertTrue(life.state.value.retry)
+    }
+    @Test fun receiverNeverStartsInitialMediaFromConnected() {
+        val r = ReceiverFixture(); r.f.server = ConnectionRequestState.CONNECTED
+        r.f.controller.refreshStatus(); r.f.worker.run()
+        assertFalse(startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.RECEIVE, true, {}) { r.owner.start(it) })
+        assertEquals(0, r.factory.opens); assertEquals(0, r.media)
+    }
+    @Test fun mediaSnapshotHasNoBearerFieldsAndCanceledPromptStopsAutomaticInitiatorMonitor() {
+        val f = Fixture(); val flow = f.initiator(); val life = ConnectionRequestMediaLifecycle(f.controller) {}
+        val fields = ConnectionRequestMediaSnapshot::class.java.declaredFields.map { it.name }
+        for (bad in listOf("requestId", "secret", "claim", "code", "url", "bootstrap")) assertFalse(fields.contains(bad))
+        life.requestExit(flow)
+        assertFalse(f.controller.initiatorMonitorSnapshot()!!.active)
+        assertFalse(f.controller.refreshInitiatorStatus(MediaRole.SEND, flow))
+    }
+    @Test fun androidWiringUsesSeparateConsentAndScrubbedReceiverHandoffs() {
+        val base = java.io.File("src/main/java/com/pradertamas/uicapturetest")
+        val sender = java.io.File(base, "RequestSenderLaunchViewModel.kt").readText()
+        val intentBuilder = sender.substringAfter("internal fun requestSenderIntent").substringBefore("@Composable")
+        assertTrue(intentBuilder.contains("WebRtcService.MODE")); assertTrue(intentBuilder.contains("WebRtcService.HANDOFF"))
+        assertTrue(intentBuilder.contains("WebRtcService.CONSENT"))
+        for (bad in listOf("WebRtcService.SESSION", "WebRtcService.INTENT", "WebRtcService.EPOCH")) assertFalse(intentBuilder.contains(bad))
+        val main = java.io.File(base, "MainActivity.kt").readText()
+        assertTrue(main.contains("RequestSenderConsent(this, requestSender, null, initiator = true)"))
+        assertTrue(main.contains("val rtcConsent = rememberLauncherForActivityResult"))
+        val receiver = java.io.File(base, "ReceiverActivity.kt").readText()
+        assertTrue(receiver.contains("override fun onNewIntent")); assertTrue(receiver.contains("removeExtra(REQUEST_MEDIA_HANDOFF)"))
+        assertTrue(receiver.contains("renderer?.let(model::detach)")); assertTrue(receiver.contains("model.attach(it)"))
+        val recipient = java.io.File(base, "ConnectionRequestActivity.kt").readText()
+        assertTrue(recipient.contains("model.mediaTransferred = true; finish()"))
+    }
 }

@@ -27,6 +27,22 @@ import org.webrtc.SurfaceViewRenderer
 
 /** Foreground-only native receiver. Configuration recreation preserves the ViewModel/peer, replaces only the renderer. */
 class ReceiverActivity : ComponentActivity() {
+    companion object { internal const val REQUEST_MEDIA_HANDOFF = "requestMediaHandoff" }
+    private fun takeRequestHandoff(value: Intent): String? {
+        val id = runCatching { value.getStringExtra(REQUEST_MEDIA_HANDOFF) }.getOrNull()
+        value.removeExtra(REQUEST_MEDIA_HANDOFF); intent?.removeExtra(REQUEST_MEDIA_HANDOFF)
+        return id
+    }
+    private fun deliverRequestHandoff(id: String?) {
+        if (id == null) return
+        RequestMediaLifecycle.coordinator
+        if (!::model.isInitialized || AppMediaRoles.role != MediaRole.RECEIVE || !model.startRequest(id))
+            ConnectionRequestMediaHandoff.process.reject(id, RequestMediaLifecycle.coordinator::requestExit)
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val id = takeRequestHandoff(intent); setIntent(intent); deliverRequestHandoff(id)
+    }
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
     private val requestSetupOwner = ConnectionRequestSetupOwner()
     override fun onResume() {
@@ -65,30 +81,58 @@ class ReceiverActivity : ComponentActivity() {
         } catch (_: Exception) { scanning = false; failure("Camera is not available. Enter the connection code instead.") }
     }
     private fun returnToSend(stopActive: Boolean = false) {
+        if (::model.isInitialized) model.requestIdentity?.let { owned ->
+            val current = ConnectionRequests.controller.mediaSnapshot()
+            if (current != null && current.flow !== owned &&
+                current.phase in setOf(RequestMediaPhase.RESERVED, RequestMediaPhase.STARTED)) {
+                model.stopRequest(owned); finish(); return
+            }
+        }
+        if (::model.isInitialized) model.requestFlow?.let { flow ->
+            val current = ConnectionRequests.controller.mediaSnapshot()?.flow
+            model.stopRequest(flow)
+            if (current != null && current !== flow) { finish(); return }
+        }
         if (AppMediaRoles.switchRole(MediaRole.SEND, stopActive)) finish()
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val requestHandoff = takeRequestHandoff(intent)
+        RequestMediaLifecycle.coordinator
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)
         enableEdgeToEdge()
         if (AppMediaRoles.role != MediaRole.RECEIVE) {
+            requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             // Process recreation defaults to SEND; never infer RECEIVE from the restored Activity type.
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
             finish(); return
         }
         try { model = ViewModelProvider(this)[ReceiverViewModel::class.java] }
         catch (_: Exception) {
+            requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             AppMediaRoles.receiverStartFailed()
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
             finish(); return
         }
+        deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }
         })
         setContent {
             val ui by model.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
+            val requestState by ConnectionRequests.controller.state.collectAsState()
+            val requestRevision by ConnectionRequests.controller.mediaChanges.collectAsState()
+            val lifecycleState by lifecycle.currentStateFlow.collectAsState()
+            LaunchedEffect(requestState, requestRevision, lifecycleState, mediaMode.role) {
+                val s = ConnectionRequests.controller.mediaSnapshot()
+                if (s?.side == ConnectionRequestSide.INITIATOR) startRequestReceiver(ConnectionRequests.controller,
+                    ConnectionRequestMediaHandoff.process, s.flow, lifecycleState == androidx.lifecycle.Lifecycle.State.RESUMED,
+                    mediaMode.role, !ConnectionRequestRuntimeGate.legacyStartAllowed(), RequestMediaLifecycle.coordinator::requestExit) {
+                    model.startRequest(it.value)
+                }
+            }
             val requestShare = rememberRequestShare(mediaMode.role) { model.stop() }
             val phase = ui.home.phase
             var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
@@ -120,6 +164,7 @@ class ReceiverActivity : ComponentActivity() {
             UICaptureTestTheme {
                 Surface(Modifier.fillMaxSize()) {
                     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
+                        RequestCleanupRetry()
                         if (phase == ReceiverPhase.RECEIVING) Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("Receiving", style = MaterialTheme.typography.titleLarge)
                             TextButton(onClick = { returnToSend(stopActive = true) }) { Text("Stop receiving") }
@@ -133,8 +178,12 @@ class ReceiverActivity : ComponentActivity() {
                                     .padding(24.dp).verticalScroll(taskScroll), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                     val canChoose = MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning
                                     val closeTask: () -> Unit = { code = ""; error = ""; selectedPath = null }
-                                    BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)
-                                    if (activePath == null) {
+                                    BackHandler(enabled = activePath != null && canChoose && model.requestFlow == null, onBack = closeTask)
+                                    if (model.requestFlow != null) {
+                                        Text(if (phase == ReceiverPhase.PAIRING) "Connecting" else ui.home.status)
+                                        TextButton(onClick = { returnToSend(stopActive = true) }) { Text("Stop receiving") }
+                                    }
+                                    if (activePath == null && model.requestFlow == null) {
                                     Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                                     Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                                     MediaRoleSelector(mediaMode.role, MediaRolePolicy.receiverSwitchAllowed(phase) && !scanning) { requested ->
@@ -150,7 +199,7 @@ class ReceiverActivity : ComponentActivity() {
                                     if (requestShare.message.isNotEmpty()) Text(requestShare.message)
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     }
-                                    if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {
+                                    if (activePath != null && model.requestFlow == null) WorkflowPanel(activePath, canChoose, closeTask) {
                                         if (phase == ReceiverPhase.PAIRING) {
                                             if (activePath == ConnectionWorkflow.SHOW && ShowConnection.receiverReady(ui.home)) {
                                                 WorkflowOwnCode(ui.home.code)
@@ -183,7 +232,10 @@ class ReceiverActivity : ComponentActivity() {
         }
     }
     override fun onStop() {
-        if (::model.isInitialized && !isChangingConfigurations && !scanning) model.stop()
+        if (::model.isInitialized && !isChangingConfigurations && !scanning) {
+            val flow = model.requestFlow
+            if (flow != null) model.stopRequest(flow) else model.stop()
+        }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }

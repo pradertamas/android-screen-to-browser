@@ -118,7 +118,8 @@ class ConnectionWorkflowTest {
         assertTrue(activity.contains("!isChangingConfigurations && !scanning"))
         assertTrue(activity.contains("addOnCanceledListener { scanning = false }"))
         assertTrue(activity.contains("Lifecycle.State.STARTED"))
-        assertTrue(activity.indexOf("val connectionShare = rememberLauncherForActivityResult") < activity.indexOf("if (activePath != null)"))
+        val share = activity.indexOf("val requestShare = rememberRequestShare")
+        assertTrue(share >= 0 && share < activity.indexOf("WorkflowPanel(activePath"))
         assertFalse(activity.contains("MediaProjection")); assertFalse(activity.contains("createScreenCaptureIntent("))
         val main = text("MainActivity.kt")
         assertTrue(main.contains("claimConsent()")); assertTrue(main.contains("createConfigForUserChoice()"))
@@ -130,7 +131,9 @@ class ConnectionWorkflowTest {
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
             val activity = text(name)
             assertTrue(activity.contains("import androidx.activity.compose.BackHandler"))
-            assertTrue(activity.contains("BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)"))
+            assertTrue(activity.contains(if (name == "ReceiverActivity.kt")
+                "BackHandler(enabled = activePath != null && canChoose && model.requestFlow == null, onBack = closeTask)"
+                else "BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)"))
             assertTrue(activity.contains("WorkflowPanel(activePath, canChoose, closeTask)"))
             val callback = activity.substringAfter("val closeTask: () -> Unit = {").substringBefore("}")
             assertTrue(callback.contains("selectedPath = null"))

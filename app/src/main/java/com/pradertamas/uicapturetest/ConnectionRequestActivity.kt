@@ -18,6 +18,7 @@ import com.pradertamas.uicapturetest.ui.theme.UICaptureTestTheme
 class ConnectionRequestActivity : ComponentActivity() {
     private val coordinator get() = ConnectionRequestRecipients.coordinator
     private lateinit var model: ConnectionRequestActivityViewModel
+    private lateinit var requestSender: RequestSenderLaunchViewModel
     private val setupOwner = ConnectionRequestSetupOwner()
     override fun onResume() {
         super.onResume()
@@ -42,13 +43,33 @@ class ConnectionRequestActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setFinishOnTouchOutside(false) // A floating window must not abandon an in-flight Accept.
         model = ViewModelProvider(this)[ConnectionRequestActivityViewModel::class.java]
+        requestSender = ViewModelProvider(this)[RequestSenderLaunchViewModel::class.java]
+        RequestMediaLifecycle.coordinator
         if (model.flow == null) incoming(intent) else { intent.data = null }
         setContent {
             val flow = model.flow
+            RequestSenderConsent(this, requestSender, flow) { model.mediaTransferred = true; finish() }
+            val request by ConnectionRequests.controller.state.collectAsState()
+            val mediaRevision by ConnectionRequests.controller.mediaChanges.collectAsState()
+            val life by lifecycle.currentStateFlow.collectAsState()
             val scoped = remember(flow) { coordinator.observe(flow) }
             val ui by scoped.collectAsState(initial = coordinator.projection(flow))
             val hasFlow = flow != null
             val media by AppMediaRoles.state.collectAsState()
+            LaunchedEffect(flow, request, mediaRevision, life, media.role, model.exiting) {
+                if (model.exiting && ConnectionRequests.controller.mediaSnapshot()?.flow !== flow) { finish(); return@LaunchedEffect }
+                if (flow != null && !model.mediaTransferred && !model.exiting) {
+                    val started = startRequestReceiver(ConnectionRequests.controller, ConnectionRequestMediaHandoff.process,
+                        flow, life == androidx.lifecycle.Lifecycle.State.RESUMED, media.role,
+                        !ConnectionRequestRuntimeGate.legacyStartAllowed(), RequestMediaLifecycle.coordinator::requestExit) { id ->
+                        startActivity(Intent(this@ConnectionRequestActivity, ReceiverActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                            .putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value))
+                        true
+                    }
+                    if (started) { model.mediaTransferred = true; finish() }
+                }
+            }
             val receiverRevision by AppMediaRoles.receiverRevision.collectAsState()
             val sender by PairingHost.state.collectAsState()
             val capture by CaptureState.state.collectAsState()
@@ -60,6 +81,7 @@ class ConnectionRequestActivity : ComponentActivity() {
                 Surface {
                     Column(Modifier.widthIn(max = 520.dp).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Connection request", style = MaterialTheme.typography.headlineSmall)
+                        RequestCleanupRetry(flow, scoped = true)
                         if (!hasFlow) {
                             Text(entryText(entryError ?: RecipientEntryError.INVALID))
                             TextButton(onClick = { finish() }) { Text("Close") }
@@ -91,7 +113,15 @@ class ConnectionRequestActivity : ComponentActivity() {
     }
     private fun closeOwned() {
         val flow = model.flow
-        if (flow == null || !coordinator.hasContext(flow)) finish() else coordinator.close(flow)
+        if (model.mediaTransferred) { finish(); return }
+        if (flow == null || !coordinator.hasContext(flow)) { finish(); return }
+        val s = ConnectionRequests.controller.mediaSnapshot()
+        if (s?.flow === flow && s.won && s.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) {
+            ConnectionRequestSetup.coordinator.suspendRecipient(flow)
+            model.exiting = true
+            requestSender.launch.cancel()
+            RequestMediaLifecycle.coordinator.requestExit(flow)
+        } else coordinator.close(flow)
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); incoming(intent) }
     private fun entryText(error: RecipientEntryError) = when (error) {

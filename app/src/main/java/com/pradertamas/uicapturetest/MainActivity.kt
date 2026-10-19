@@ -38,6 +38,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
+    private lateinit var requestSender: RequestSenderLaunchViewModel
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
     private val requestSetupOwner = ConnectionRequestSetupOwner()
     private var externalUi = false
@@ -81,6 +82,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        requestSender = ViewModelProvider(this)[RequestSenderLaunchViewModel::class.java]
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)
         PairingHost.initialize(this)
@@ -88,6 +90,7 @@ class MainActivity : ComponentActivity() {
         externalUi = savedInstanceState?.getBoolean("externalUi", false) ?: false
         enableEdgeToEdge()
         setContent {
+            RequestSenderConsent(this, requestSender, null, initiator = true)
             val state by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
@@ -178,6 +181,7 @@ class MainActivity : ComponentActivity() {
                     val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(taskScroll),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        RequestCleanupRetry()
                         val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
                         val closeTask: () -> Unit = { PairingHost.controller.typed(""); joinCode = ""; selectedPath = null }
                         BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)

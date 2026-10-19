@@ -35,6 +35,9 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
     }, { home -> mutable.value = if (home.phase == ReceiverPhase.PAIRING) ReceiverUi(home) else mutable.value.copy(home = home); AppMediaRoles.receiverPhaseChanged() })
     private val request = RequestReceiverOwner(engine, wire, ConnectionRequestMediaHandoff.process,
         { action -> main.post { action() } })
+    private var retainedRequestFlow: Any? = null
+    internal val requestIdentity: Any? get() = retainedRequestFlow
+    internal val requestFlow: Any? get() = if (request.active) retainedRequestFlow else null
     init {
         AppMediaRoles.bindReceiver(this, ::stop, { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) })
         ConnectionRequestRuntimeGate.runLegacyStart { engine.create() }
@@ -46,7 +49,13 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
         check(Looper.myLooper() == Looper.getMainLooper())
         if (AppMediaRoles.role != MediaRole.RECEIVE || request.active ||
             !MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase)) return false
-        return request.start(handoff)
+        if (ConnectionRequestRuntimeGate.legacyStartAllowed()) return false
+        val flow = ConnectionRequestMediaHandoff.process.flowFor(handoff) ?: return false
+        if (runCatching { AppMediaRoles.bindReceiver(this, ::stop,
+                { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) }) }.isFailure) return false
+        val started = request.start(handoff)
+        if (started) retainedRequestFlow = flow
+        return started
     }
     internal fun stopRequest(flow: Any): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
