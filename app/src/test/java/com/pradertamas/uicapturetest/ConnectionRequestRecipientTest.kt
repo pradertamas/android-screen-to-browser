@@ -374,7 +374,7 @@ class ConnectionRequestRecipientTest {
         val file = listOf(File("src/main/AndroidManifest.xml"), File("app/src/main/AndroidManifest.xml")).first { it.isFile }
         val text = file.readText(); val activity = text.substringAfter("android:name=\".ConnectionRequestActivity\"").substringBefore("</activity>")
         for (required in listOf("android:exported=\"true\"", "android:launchMode=\"singleTop\"", "android:autoVerify=\"true\"", "android.intent.action.VIEW", "android.intent.category.BROWSABLE", "android.intent.category.DEFAULT", "android:scheme=\"https\"", "android:path=\"/connect\"")) assertTrue(activity.contains(required))
-        assertFalse(activity.contains("pathPrefix")); assertTrue(text.contains("android:name=\".PairingInviteActivity\""))
+        assertFalse(activity.contains("pathPrefix")); assertFalse(text.contains("android:name=\".PairingInviteActivity\""))
     }
     @Test fun recipientFlowHasNoMediaSignalingOrPolling() {
         val text = source("ConnectionRequestActivity") + source("ConnectionRequestRecipientCoordinator")

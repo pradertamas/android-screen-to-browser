@@ -3,7 +3,6 @@ package com.pradertamas.uicapturetest
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
-import java.util.Base64
 
 class ConnectionWorkflowTest {
     private val source = sequenceOf(File("src/main/java/com/pradertamas/uicapturetest"), File("app/src/main/java/com/pradertamas/uicapturetest")).first { it.isDirectory }
@@ -17,12 +16,6 @@ class ConnectionWorkflowTest {
         assertTrue(ui.indexOf("Text(shareLabel)") >= 0)
         assertTrue(ui.indexOf("Text(shareLabel)") < ui.indexOf("WorkflowAction(\"Connect to another device"))
         assertTrue(ui.indexOf("WorkflowAction(\"Connect to another device") < ui.indexOf("WorkflowAction(\"Let another device connect here"))
-        val inviteUi = text("AppPairingSection.kt")
-        assertFalse(inviteUi.contains("Manage saved connections")); assertFalse(inviteUi.contains("expanded"))
-        assertTrue(inviteUi.contains("onClick = { model.create(allowed) }"))
-        assertTrue(inviteUi.contains("AppPairingLink.shareText(delivery, model.config)"))
-        assertTrue(inviteUi.contains("model.shared(value)")); assertTrue(inviteUi.contains("Intent.createChooser"))
-        assertTrue(inviteUi.contains("30 minutes and can be used once"))
         assertFalse(ui.contains("4. Status")); assertFalse(ui.contains("switchRole(")); assertFalse(ui.contains("createScreenCaptureIntent("))
         assertFalse(ui.contains("startForegroundService(")); assertFalse(ui.contains("model.join("))
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
@@ -57,7 +50,6 @@ class ConnectionWorkflowTest {
         assertTrue(selector.contains("inactiveContainerColor = MaterialTheme.colorScheme.surface"))
         assertTrue(selector.contains("selected = role == value"))
         assertTrue(selector.contains("heightIn(min = 56.dp)"))
-        assertTrue(text("PairingInviteActivity.kt").contains("AppPairingSection"))
     }
     @Test fun taskViewsHideHomeAndStartAtTopWithoutShareActions() {
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {
@@ -76,32 +68,6 @@ class ConnectionWorkflowTest {
         assertTrue(text("ConnectionWorkflow.kt").contains("Text(\"Back\")"))
         assertTrue(text("MainActivity.kt").contains("scanning = false; externalUi = false"))
         assertTrue(text("ReceiverActivity.kt").contains("addOnCanceledListener { scanning = false }"))
-    }
-    @Test fun onlyValidPublicDeviceIdentifiersCanBeDisplayed() {
-        val id = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(16) { 7 })
-        assertEquals(id, PairedDevice.fromPublicId(id)?.publicId)
-        assertNull(PairedDevice.fromPublicId("")); assertNull(PairedDevice.fromPublicId("Galaxy S25"))
-        val credential = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 9 })
-        assertNull(PairedDevice.fromPublicId(credential)); assertNull(PairedDevice.fromPublicId(id + "="))
-        assertTrue(emptyList<PairedDevice>().isEmpty())
-        val ui = text("ConnectionWorkflow.kt")
-        assertFalse(ui.contains("device.publicId")); assertFalse(ui.contains("devices.forEach"))
-        assertFalse(ui.contains("device.credential")); assertFalse(ui.contains("Galaxy S25"))
-    }
-    @Test fun listRefreshDoesNotCreateOrReplaceDeviceIdentity() {
-        var stored: DeviceIdentity? = null
-        var writes = 0
-        val store = DeviceIdentityStore({ stored }, { writes++; stored = it; true })
-        assertNull(store.existing()); assertEquals(0, writes)
-        val id = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(16))
-        val credential = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32))
-        stored = DeviceIdentity(id, credential)
-        assertSame(stored, store.existing()); assertEquals(0, writes)
-        stored = DeviceIdentity("invalid", credential); assertNull(store.existing())
-        val vm = text("AppPairingViewModel.kt")
-        val refresh = vm.substringAfter("fun refreshDevices()").substringBefore("private var incoming")
-        assertTrue(refresh.contains(".existing() ?: return")); assertFalse(refresh.contains("ensure(")); assertFalse(refresh.contains("register("))
-        assertTrue(refresh.contains("api.listPairings(identity)")); assertTrue(refresh.contains("otherDeviceId"))
     }
     @Test fun qrCodeAndLinkUseTheExistingSixCharacterProtocol() {
         val url = PairingCode.receiverUrl("7K4M2Q")
@@ -124,9 +90,6 @@ class ConnectionWorkflowTest {
         assertFalse(activity.contains("MediaProjection")); assertFalse(activity.contains("createScreenCaptureIntent("))
         val main = text("MainActivity.kt")
         assertTrue(main.contains("claimConsent()")); assertTrue(main.contains("createConfigForUserChoice()"))
-        val section = text("AppPairingSection.kt")
-        assertTrue(section.contains("model.accept(allowed)")); assertFalse(section.contains("startForegroundService("))
-        assertFalse(section.contains("switchRole(")); assertFalse(section.contains("model.join("))
     }
     @Test fun systemBackAndVisibleBackShareOnlyTheEnabledTaskCallback() {
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt")) {

@@ -24,14 +24,6 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <service android:name=".WebRtcService" android:exported="false" android:foregroundServiceType="mediaProjection" />
-        <activity android:name=".PairingInviteActivity" android:exported="true" android:launchMode="singleTop" android:theme="@style/Theme.PairingInvite">
-            <intent-filter android:autoVerify="true">
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" android:host="${pairingAppLinkHost}" android:path="${pairingAppLinkPath}" />
-            </intent-filter>
-        </activity>
         <activity android:name=".ConnectionRequestActivity" android:exported="true" android:launchMode="singleTop" android:theme="@style/Theme.PairingInvite">
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
