@@ -46,7 +46,7 @@ class ReceiverEngine(private val wire: ReceiverWire,
     private var rotation: (() -> Unit)? = null
     private var grace: (() -> Unit)? = null
     private fun publish(value: ReceiverHome) { home = value; changed(value) }
-    fun create() { if (mode == ReceiverMode.LEGACY) begin(generate(), PairingIntent.CREATE) }
+    fun create() { if (mode == ReceiverMode.LEGACY && MediaRolePolicy.receiverSwitchAllowed(home.phase)) begin(generate(), PairingIntent.CREATE) }
     fun join(input: String): Boolean {
         if (mode != ReceiverMode.LEGACY) return false
         val code = PairingCode.normalize(input) ?: return false

@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onResume() {
         super.onResume()
+        ReceiverSessions.checkExpiry()
         ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.SEND)
         ConnectionRequestSetup.coordinator.foreground(requestSetupOwner, MediaRole.SEND)
         traceActivity("activity-onResume")
@@ -66,7 +67,10 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         traceActivity("activity-onStart")
-        if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()
+        ReceiverSessions.checkExpiry()
+        if (AppMediaRoles.role == MediaRole.RECEIVE) {
+            if (!ReceiverSessions.state.value.presence.live) openReceiver()
+        }
         else if (!CaptureState.state.value.busy) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
     }
     override fun onStop() {
@@ -94,6 +98,7 @@ class MainActivity : ComponentActivity() {
             val state by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
             val mediaMode by AppMediaRoles.state.collectAsState()
+            val receiver by ReceiverSessions.state.collectAsState()
             val requestShare = rememberRequestShare(mediaMode.role) {
                 PairingHost.controller.hide()
                 PairingHost.controller.close()
@@ -105,6 +110,9 @@ class MainActivity : ComponentActivity() {
             val lifecycleState by lifecycle.currentStateFlow.collectAsState()
             var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var joinCode by rememberSaveable { mutableStateOf("") }
+            LaunchedEffect(receiver.presence.live) {
+                if (receiver.presence.live) { selectedPath = null; joinCode = "" }
+            }
             var regenerateRemote by remember { mutableStateOf(false) }
             var remoteFeedback by remember { mutableStateOf("Remote link ready") }
             val rtcConsent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -176,21 +184,21 @@ class MainActivity : ComponentActivity() {
             }
             UICaptureTestTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                        val activePath = selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
+                        val activePath = if (receiver.presence.live) null else selectedPath ?: if (rtc.busy || home.phase in setOf(PairingPhase.JOINING, PairingPhase.CONSENT, PairingPhase.CONNECTING, PairingPhase.STREAMING)) {
                             if (home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
                         } else null
                     val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
                     Column(Modifier.padding(padding).padding(24.dp).verticalScroll(taskScroll),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         RequestCleanupRetry()
-                        val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning
+                        val canChoose = MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning && !receiver.active
                         val closeTask: () -> Unit = { PairingHost.controller.typed(""); joinCode = ""; selectedPath = null }
                         BackHandler(enabled = activePath != null && canChoose, onBack = closeTask)
                         if (activePath == null) {
                         Text("Screen Share", style = MaterialTheme.typography.headlineLarge)
                         Text("1. Choose role", style = MaterialTheme.typography.titleMedium)
                         MediaRoleSelector(mediaMode.role,
-                            MediaRolePolicy.senderSwitchAllowed(home.phase, state.busy, rtc.busy) && !scanning) { requested ->
+                            canChoose) { requested ->
                             if (requested != mediaMode.role && AppMediaRoles.switchRole(requested)) {
                                 selectedPath = null; joinCode = ""
                                 if (requested == MediaRole.RECEIVE) openReceiver()
@@ -198,7 +206,12 @@ class MainActivity : ComponentActivity() {
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = requestShare.start,
-                            shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label) { path ->
+                            shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label,
+                            activeShare = receiver.presence.session?.takeIf { receiver.presence.live }?.let { id ->
+                                { navigateActiveReceiver(this@MainActivity, id); Unit }
+                            }, stopActiveShare = {
+                                receiver.presence.session?.let(ReceiverSessions::stop)
+                            }) { path ->
                             if (!requestShare.busy) {
                                 val entry = enterManualConnection(ConnectionRequests.controller, MediaRole.SEND,
                                     RequestMediaLifecycle.coordinator::requestExit)

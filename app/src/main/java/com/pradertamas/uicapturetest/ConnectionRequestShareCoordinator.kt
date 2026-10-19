@@ -35,6 +35,7 @@ internal class ConnectionRequestShareCoordinator(
 
     fun start(owner: ConnectionRequestShareOwner, role: MediaRole, stopLegacy: () -> Unit) = synchronized(lock) {
         if (mutable.value.busy) return@synchronized
+        if (ReceiverSessions.active) { mutable.value = RequestShareUi(error = RequestShareError.UNAVAILABLE); return@synchronized }
         val current = controller.state.value
         val readOnlyStatus = current.operation == ConnectionRequestOperation.STATUS && controller.shareableInitiatorData(role) != null
         if ((current.operation != null && !readOnlyStatus) || current.side == ConnectionRequestSide.RECIPIENT ||

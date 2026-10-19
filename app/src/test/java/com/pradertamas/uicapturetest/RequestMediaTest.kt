@@ -11,6 +11,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RequestMediaTest {
+    @Test fun productionAdmissionBlocksCreateShareAndLegacyDispatchDuringLiveOrGrace() {
+        // Test the actual production boundaries without adding a mutable production test API.
+        @Suppress("UNCHECKED_CAST")
+        val flow = ReceiverSessions.javaClass.getDeclaredField("mutable").apply { isAccessible = true }
+            .get(ReceiverSessions) as kotlinx.coroutines.flow.MutableStateFlow<ReceiverUi>
+        val original = flow.value
+        val allowed = ConnectionRequestRuntimeGate.legacyStartAllowed()
+        ConnectionRequestRuntimeGate.releaseRequestFirst()
+        try {
+            for (visible in listOf(true, false)) {
+                flow.value = ReceiverUi(presence = ReceiverPresence(ReceiverSessionIdentity(), true, visible,
+                    if (visible) null else 60000L))
+                val f = Fixture(); var legacy = 0
+                assertNull(f.controller.create(MediaRole.SEND)); f.worker.run(); assertEquals(0, f.creates)
+                assertNull(ConnectionRequestRuntimeGate.runLegacyStart { legacy++ }); assertEquals(0, legacy)
+                assertFalse(AppMediaRoles.pairingAllowed())
+                val sharing = ConnectionRequestShareCoordinator(f.controller)
+                sharing.start(ConnectionRequestShareOwner(), MediaRole.SEND) { legacy++ }
+                assertEquals(RequestShareError.UNAVAILABLE, sharing.state.value.error)
+                assertEquals(0, legacy); assertEquals(0, f.creates)
+            }
+        } finally {
+            flow.value = original
+            if (!allowed) ConnectionRequestRuntimeGate.armRequestFirst()
+        }
+    }
     private fun token(n: Int, bytes: Int = 16) = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(bytes) { n.toByte() })
     private class Queue : Executor {
         val tasks = ArrayDeque<Runnable>()
@@ -174,6 +200,7 @@ class RequestMediaTest {
         val f = Fixture(); val flow: Any = if (recipient) f.recipient() else f.initiator(MediaRole.RECEIVE)
         val factory = Factory(); val q = Queue(); val timers = mutableListOf<Long>(); var generated = 0; var media = 0; var disposed = 0
         val receivedIce = mutableListOf<ReceiverIce>()
+        var onHome: ((ReceiverHome) -> Unit)? = null
         val scheduled = mutableMapOf<Any, Pair<Long, () -> Unit>>()
         var localIce: ((ReceiverIce) -> Unit)? = null
         var mediaFailure: (() -> Unit)? = null
@@ -191,7 +218,7 @@ class RequestMediaTest {
             timers.add(ms)
             val key = Any(); scheduled[key] = ms to action
             val cancel: () -> Unit = { scheduled.remove(key); Unit }; cancel
-        }, {}, { generated++; "ABC234" })
+        }, { onHome?.invoke(it) }, { generated++; "ABC234" })
         val owner = RequestReceiverOwner(engine, router, f.handoffs, q::dispatch, factory)
         fun start() { assertTrue(owner.start(f.handoffs.reserve(flow, MediaRole.RECEIVE)!!)) }
         fun register() { factory.register(MediaRole.RECEIVE, if (flow is ConnectionRequestRecipientFlow) PairingIntent.JOIN else PairingIntent.CREATE); q.run() }
@@ -224,6 +251,33 @@ class RequestMediaTest {
         assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
         assertTrue(r.owner.active); assertEquals(1, r.media); assertEquals(1, r.factory.opens)
         assertEquals("answer", JSONObject(r.factory.socket.sent.last()).getString("type"))
+    }
+    @Test fun requestPeerAndStartedAuthoritySurviveHiddenViewerWithoutHttpOrBootstrap() {
+        val r = ReceiverFixture(true); var now = 0L; val timers = mutableListOf<() -> Unit>()
+        val life = ReceiverVisibility({ now }, { _, action -> timers.add(action); {} }, {}, { r.owner.stop(r.flow) })
+        r.onHome = { life.connection(it.phase) }
+        val viewer = Any(); life.visible(viewer)
+        r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"live"}"""); r.q.run(); r.engine.firstFrame()
+        val identity = life.state.session
+        life.hidden(viewer, false); now = 20000; life.visible(Any()); timers.forEach { it() }
+        assertSame(identity, life.state.session); assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+        assertEquals(RequestMediaPhase.STARTED, r.f.controller.mediaPhaseForFlow(r.flow))
+        assertTrue(r.owner.active); assertEquals(1, r.media); assertEquals(1, r.factory.opens)
+        assertEquals(0, r.disposed); assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+    }
+    @Test fun networkGraceCanEndHiddenReceiverBeforeUiGraceAndOnlyDisposeOnce() {
+        val r = ReceiverFixture(true); var now = 0L; val uiTimers = mutableListOf<() -> Unit>(); var expiries = 0
+        val life = ReceiverVisibility({ now }, { _, action -> uiTimers.add(action); {} }, {}, { expiries++; r.owner.stop(r.flow) })
+        r.onHome = { life.connection(it.phase) }; val viewer = Any(); life.visible(viewer)
+        r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"live"}"""); r.q.run(); r.engine.firstFrame(); life.hidden(viewer, false)
+        repeat(3) { r.engine.connection("DISCONNECTED") }
+        assertEquals(1, r.scheduled.values.count { it.first == 4000L })
+        r.scheduled.values.single { it.first == 4000L }.second()
+        assertEquals(ReceiverPhase.ERROR, r.engine.home.phase); assertFalse(r.owner.active); assertEquals(1, r.disposed)
+        now = 60000; uiTimers.forEach { it() }; assertEquals(0, expiries)
+        assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
     }
     @Test fun receiverNavigationRequiresEffectiveReceiveRoleBeforeDispatch() {
         val r = ReceiverFixture(true); var navigations = 0
@@ -900,7 +954,9 @@ class RequestMediaTest {
         assertTrue(create.indexOf("ensureBoundToTask(taskId)") < create.indexOf("deliverRequestHandoff(requestHandoff)"))
         assertTrue(activity.substringAfter("override fun onResume").substringBefore("override fun onPause").contains("ensureBoundToTask(taskId)"))
         val vm = java.io.File(base, "ReceiverViewModel.kt").readText()
-        val attach = vm.substringAfter("internal fun ensureBoundToTask").substringBefore("private val main")
+        assertTrue(vm.contains("owner.ensureBoundToTask(taskId)"))
+        val central = java.io.File(base, "ReceiverSessionCoordinator.kt").readText()
+        val attach = central.substringAfter("fun ensureBoundToTask").substringBefore("fun viewerVisible")
         assertTrue(attach.contains("bindReceiverToTask(this, taskId"))
         for (forbidden in listOf("engine.", "request.start", "reserve(", "consume(", "startActivity", "api."))
             assertFalse(attach.contains(forbidden))

@@ -25,5 +25,5 @@ object ConnectionRequestRuntimeGate {
     fun armRequestFirst() = gate.armRequestFirst()
     fun releaseRequestFirst() = gate.releaseRequestFirst()
     fun legacyStartAllowed() = gate.legacyStartAllowed()
-    fun <T> runLegacyStart(start: () -> T): T? = gate.runLegacyStart(start)
+    fun <T> runLegacyStart(start: () -> T): T? = if (ReceiverSessions.active) null else gate.runLegacyStart(start)
 }

@@ -21,12 +21,21 @@ object ConnectionWorkflow {
 
 @Composable
 fun WorkflowStart(allowed: Boolean, path: String?, share: () -> Unit, shareEnabled: Boolean = allowed,
-    shareLabel: String = "Share connection link", select: (String) -> Unit) {
+    shareLabel: String = "Share connection link", activeShare: (() -> Unit)? = null,
+    stopActiveShare: () -> Unit = {}, select: (String) -> Unit) {
     OutlinedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("2. Choose how to start", style = MaterialTheme.typography.titleMedium)
-            Button(onClick = share, enabled = shareEnabled, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
-                Text(shareLabel)
+            if (activeShare != null) {
+                Button(onClick = activeShare, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text("Show active share") }
+                TextButton(onClick = stopActiveShare, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
+                    Text("Stop active share")
+                }
+                Text("Stop the active share to start another connection.")
+            } else {
+                Button(onClick = share, enabled = shareEnabled, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                    Text(shareLabel)
+                }
             }
             WorkflowAction("Connect to another device", "Use a QR code or enter a code from another device.", path == ConnectionWorkflow.CONNECT, allowed) { select(ConnectionWorkflow.CONNECT) }
             WorkflowAction("Let another device connect here", "Show a QR code or connection code on this device.", path == ConnectionWorkflow.SHOW, allowed) { select(ConnectionWorkflow.SHOW) }

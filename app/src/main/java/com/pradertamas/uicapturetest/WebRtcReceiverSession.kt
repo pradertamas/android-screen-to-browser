@@ -91,7 +91,8 @@ class WebRtcReceiverSession(context: Context, private val candidate: (ReceiverIc
         view.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         track?.addSink(view)
     }
-    fun detach() {
+    fun detach(expected: SurfaceViewRenderer? = renderer) {
+        if (renderer !== expected) return
         rendererEpoch++
         val view = renderer; renderer = null
         if (view != null) {

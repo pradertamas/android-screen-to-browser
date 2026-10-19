@@ -59,9 +59,10 @@ object AppMediaRoles {
     }, { mutable.value = it })
     fun switchRole(requested: MediaRole, stopActive: Boolean = false): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
+        if (ReceiverSessions.active && requested != role && !stopActive) return false
         return controller.switchRole(requested, stopActive)
     }
-    fun pairingAllowed(): Boolean = when (role) {
+    fun pairingAllowed(): Boolean = !ReceiverSessions.active && when (role) {
         MediaRole.SEND -> MediaRolePolicy.senderSwitchAllowed(PairingHost.state.value.phase, CaptureState.state.value.busy, WebRtcState.state.value.busy)
         MediaRole.RECEIVE -> receiver?.canLeave?.invoke() ?: true
     }
@@ -85,5 +86,6 @@ object AppMediaRoles {
         receivers.bind(role, identity, stop, canLeave, taskId)
     }
     internal fun receiverAttached(identity: Any) = receivers.attached(identity)
+    internal fun receiverBound(identity: Any) = receivers.current?.identity === identity
     fun unbindReceiver(identity: Any) { receivers.unbind(identity) }
 }

@@ -82,9 +82,9 @@ class ConnectionWorkflowTest {
     @Test fun receiverScannerDoesNotAddCaptureOrMediaPermissionPath() {
         val activity = text("ReceiverActivity.kt")
         assertTrue(activity.contains("GmsBarcodeScanning.getClient")); assertTrue(activity.contains("PairingCode.parseQr"))
-        assertTrue(activity.contains("!isChangingConfigurations && !scanning"))
+        assertTrue(activity.contains("viewerHidden(viewerIdentity, isChangingConfigurations, scanning)"))
         assertTrue(activity.contains("addOnCanceledListener { scanning = false }"))
-        assertTrue(activity.contains("Lifecycle.State.STARTED"))
+        assertFalse(activity.contains("!lifecycle.currentState.isAtLeast"))
         val share = activity.indexOf("val requestShare = rememberRequestShare")
         assertTrue(share >= 0 && share < activity.indexOf("WorkflowPanel(activePath"))
         assertFalse(activity.contains("MediaProjection")); assertFalse(activity.contains("createScreenCaptureIntent("))
@@ -109,22 +109,19 @@ class ConnectionWorkflowTest {
         val main = text("MainActivity.kt")
         assertTrue(main.contains("val closeTask: () -> Unit = { PairingHost.controller.typed(\"\"); joinCode = \"\"; selectedPath = null }"))
         val receiver = text("ReceiverActivity.kt")
-        assertTrue(receiver.contains("override fun handleOnBackPressed() { returnToSend(stopActive = true) }"))
+        assertTrue(receiver.contains("override fun handleOnBackPressed() { viewerBack() }"))
         assertTrue(receiver.contains("if (phase != ReceiverPhase.RECEIVING)"))
         assertTrue(receiver.indexOf("onBackPressedDispatcher.addCallback") < receiver.indexOf("BackHandler(enabled"))
         for (path in listOf(ConnectionWorkflow.CONNECT, ConnectionWorkflow.SHOW)) {
             assertNotNull(ConnectionWorkflow.title(path)) // Both paths use the same activePath gate.
         }
     }
-    @Test fun rootDiagnosticsFollowWorkflowInsideThePaddedScrollableColumn() {
+    @Test fun receiverDiagnosticsAreRetainedForDeveloperUiButNotCalledByNormalScreen() {
         val receiver = text("ReceiverActivity.kt")
-        val rootColumn = receiver.substringAfter(".padding(24.dp).verticalScroll(taskScroll)")
-            .substringBefore("if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()")
-        assertTrue(rootColumn.contains("Arrangement.spacedBy(12.dp)"))
-        assertTrue(rootColumn.indexOf("WorkflowStart(") < rootColumn.indexOf("if (activePath == null) diagnosticsContent()"))
-        assertTrue(rootColumn.contains("if (activePath == null) diagnosticsContent()"))
-        assertTrue(receiver.contains("if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()"))
-        val content = receiver.substringAfter("val diagnosticsContent: @Composable () -> Unit = {").substringBefore("LaunchedEffect(phase)")
+        assertFalse(receiver.contains("diagnosticsContent()"))
+        assertFalse(receiver.substringBefore("internal fun ReceiverDiagnostics").contains("ReceiverDiagnostics("))
+        assertFalse(receiver.contains("Text(\"Receiving\""))
+        val content = receiver.substringAfter("internal fun ReceiverDiagnostics")
         assertTrue(content.contains("diagnostics = !diagnostics"))
         assertTrue(content.contains("if (diagnostics) Column"))
         assertTrue(content.contains("heightIn(max = 220.dp)"))

@@ -74,12 +74,12 @@ class ConnectionRequestRuntimeGateTest {
         val text = source("MainActivity")
         for (call in listOf("PairingHost.controller.show()", "PairingHost.controller.claimConsent()", "rtcConsent.launch(",
             "PairingHost.controller.create()", "PairingHost.controller.join(code)", "PairingHost.controller.typed(normalized)")) assertGuarded(text, call)
-        assertTrue(text.contains("if (AppMediaRoles.role == MediaRole.RECEIVE) openReceiver()"))
+        assertTrue(text.contains("if (!ReceiverSessions.state.value.presence.live) openReceiver()"))
         assertFalse(text.substringAfter("LaunchedEffect(").substringBefore(") {").contains("Gate"))
     }
     @Test fun roleActivationActuallyUsesGate() { assertGuarded(source("AppMediaRoles"), "PairingHost.controller.show()") }
     @Test fun receiverProductionStartsUseGateButBindingAndStopDoNot() {
-        val text = source("ReceiverViewModel")
+        val text = source("ReceiverSessionCoordinator")
         assertGuarded(text, "engine.create()"); assertGuarded(text, "engine.join(value)")
         val regions = guardedRegions(text)
         for (call in listOf("AppMediaRoles.bindReceiver(", "engine.stop()")) {
@@ -89,7 +89,7 @@ class ConnectionRequestRuntimeGateTest {
     @Test fun hideCloseAndReceiverStopRemainOutsideGate() {
         for ((name, calls) in listOf("MainActivity" to listOf("PairingHost.controller.hide()"),
             "AppMediaRoles" to listOf("PairingHost.controller.hide()", "PairingHost.controller.close()"),
-            "ReceiverViewModel" to listOf("engine.stop()"))) {
+            "ReceiverSessionCoordinator" to listOf("engine.stop()"))) {
             val text = source(name); val regions = guardedRegions(text)
             for (call in calls) for (match in Regex(Regex.escape(call)).findAll(text)) assertFalse(regions.any { match.range.first in it })
         }

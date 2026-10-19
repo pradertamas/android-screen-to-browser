@@ -19,6 +19,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -27,6 +32,7 @@ import org.webrtc.SurfaceViewRenderer
 
 /** Foreground-only native receiver. Configuration recreation preserves the ViewModel/peer, replaces only the renderer. */
 class ReceiverActivity : ComponentActivity() {
+    private val viewerIdentity = Any()
     companion object { internal const val REQUEST_MEDIA_HANDOFF = "requestMediaHandoff" }
     private fun takeRequestHandoff(value: Intent): String? {
         val id = runCatching { value.getStringExtra(REQUEST_MEDIA_HANDOFF) }.getOrNull()
@@ -35,6 +41,7 @@ class ReceiverActivity : ComponentActivity() {
     }
     private fun deliverRequestHandoff(id: String?) {
         val attached = ::model.isInitialized && model.ensureBoundToTask(taskId)
+        if (attached) model.owner.viewerAttached(viewerIdentity)
         if (id == null) return
         RequestMediaLifecycle.coordinator
         if (!attached || !model.startRequest(id)) {
@@ -62,6 +69,26 @@ class ReceiverActivity : ComponentActivity() {
         super.onPause()
     }
     private lateinit var model: ReceiverViewModel
+    override fun onStart() {
+        super.onStart()
+        if (::model.isInitialized) {
+            model.owner.viewerVisible(viewerIdentity)
+            if (AppMediaRoles.role != MediaRole.RECEIVE) { showMain(); return }
+            renderer?.let(model::attach)
+            if (model.state.value.presence.live) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+    private fun showMain() {
+        startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+        finishReceiver()
+    }
+    private fun viewerBack() {
+        if (::model.isInitialized && model.state.value.presence.live) {
+            model.owner.viewerHidden(viewerIdentity, false, false)
+            renderer?.let(model::detach)
+            showMain()
+        } else returnToSend(stopActive = true)
+    }
     private fun finishReceiver() {
         RequestFlowTrace.record(RequestFlowTrace.Event.FINISH_RECEIVER_RETURN,
             if (::model.isInitialized) model.requestIdentity else null,
@@ -139,7 +166,7 @@ class ReceiverActivity : ComponentActivity() {
         }
         deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() { returnToSend(stopActive = true) }
+            override fun handleOnBackPressed() { viewerBack() }
         })
         setContent {
             val ui by model.state.collectAsState()
@@ -164,21 +191,12 @@ class ReceiverActivity : ComponentActivity() {
                 if (ui.home.intent == PairingIntent.CREATE) ConnectionWorkflow.SHOW else ConnectionWorkflow.CONNECT
             } else null
             val taskScroll = remember(activePath) { androidx.compose.foundation.ScrollState(0) }
-            var diagnostics by remember { mutableStateOf(false) }
+            var showStop by remember { mutableStateOf(false) }
+            var stopReveal by remember { mutableIntStateOf(0) }
+            LaunchedEffect(showStop, stopReveal) {
+                if (showStop) { kotlinx.coroutines.delay(3000); showStop = false }
+            }
             var error by remember { mutableStateOf("") }
-            val diagnosticsContent: @Composable () -> Unit = {
-                        TextButton(onClick = { diagnostics = !diagnostics }) { Text("Advanced diagnostics") }
-                        if (diagnostics) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(12.dp)) {
-                            Text("Media role: "+mediaMode.role.name)
-                            Text("Current received video: ${ui.resolution}")
-                            Text(ui.metrics)
-                        }
-            }
-            LaunchedEffect(phase) {
-                // An external waiting-only scanner/share UI must not enable background receiving.
-                if (phase in setOf(ReceiverPhase.CONNECTING, ReceiverPhase.RECEIVING) &&
-                    !lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) model.stop()
-            }
             DisposableEffect(phase) {
                 if (phase == ReceiverPhase.RECEIVING) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -188,14 +206,21 @@ class ReceiverActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                         RequestCleanupRetry()
-                        if (phase == ReceiverPhase.RECEIVING) Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Receiving", style = MaterialTheme.typography.titleLarge)
-                            TextButton(onClick = { returnToSend(stopActive = true) }) { Text("Stop receiving") }
-                        }
-                        Box(Modifier.weight(1f).fillMaxWidth()) {
+                        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(Color.Black)
+                            .pointerInput(phase) { detectTapGestures { if (phase == ReceiverPhase.RECEIVING) { showStop = true; stopReveal++ } } },
+                            contentAlignment = Alignment.Center) {
                             // Keep a surface available behind the opaque pairing/connecting UI so the first frame can render.
+                            val frame = ui.frame
+                            val fit = frame?.let { receiverAspectFit(maxWidth.value, maxHeight.value, it) }
+                            val videoSize = if (fit != null) Modifier.size(fit.width.dp, fit.height.dp) else Modifier.fillMaxSize()
                             AndroidView(factory = { context -> SurfaceViewRenderer(context).also { renderer = it; model.attach(it) } },
-                                modifier = Modifier.fillMaxSize())
+                                modifier = videoSize.alpha(if (frame == null) 0f else 1f), onReset = null,
+                                onRelease = { model.detach(it); if (renderer === it) renderer = null })
+                            if (phase == ReceiverPhase.RECEIVING && showStop) {
+                                val shownSession = ui.presence.session
+                                Button(onClick = { if (shownSession != null && model.owner.stopActive(shownSession)) showMain() },
+                                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)) { Text("Stop receiving") }
+                            }
                             if (phase != ReceiverPhase.RECEIVING) {
                                 Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)
                                     .padding(24.dp).verticalScroll(taskScroll), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -261,27 +286,38 @@ class ReceiverActivity : ComponentActivity() {
                                             Button(onClick = { code = ""; error = ""; model.retry() }) { Text("Retry receiving") }
                                         }
                                     }
-                                    if (activePath == null) diagnosticsContent()
 
                                 }
                             }
                         }
-                        if (phase == ReceiverPhase.RECEIVING && activePath == null) diagnosticsContent()
                     }
                 }
             }
         }
     }
     override fun onStop() {
-        if (::model.isInitialized && !isChangingConfigurations && !scanning) {
-            val flow = model.requestFlow
-            if (flow != null) model.stopRequest(flow) else model.stop()
+        if (::model.isInitialized) {
+            model.owner.viewerHidden(viewerIdentity, isChangingConfigurations, scanning)
+            renderer?.let(model::detach)
         }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onStop()
     }
     override fun onDestroy() {
         if (::model.isInitialized) renderer?.let(model::detach); renderer = null
+        if (::model.isInitialized) model.owner.viewerDestroyed(viewerIdentity, isChangingConfigurations)
         super.onDestroy()
+    }
+}
+
+/** Retained developer UI; deliberately not invoked by the normal receiver screen. */
+@Composable
+internal fun ReceiverDiagnostics(ui: ReceiverUi, role: MediaRole) {
+    var diagnostics by remember { mutableStateOf(false) }
+    TextButton(onClick = { diagnostics = !diagnostics }) { Text("Advanced diagnostics") }
+    if (diagnostics) Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(12.dp)) {
+        Text("Media role: " + role.name)
+        Text("Current received video: ${ui.resolution}")
+        Text(ui.metrics)
     }
 }

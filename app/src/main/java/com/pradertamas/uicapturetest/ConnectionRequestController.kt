@@ -96,6 +96,7 @@ class ConnectionRequestController(
     /** Replacement Cancel is best-effort. Its failure is exposed on the new snapshot,
      * but never restores the old local context. The old server request may await expiry. */
     internal fun create(role: MediaRole): ConnectionRequestCreateAttempt? = synchronized(lock) {
+        if (ReceiverSessions.active) { rejected(); return@synchronized null }
         val old = context
         if (old?.metadata?.state == ConnectionRequestState.CONNECTED || old?.side == ConnectionRequestSide.RECIPIENT ||
             old?.mediaOwner?.phase == RequestMediaPhase.STARTED) {

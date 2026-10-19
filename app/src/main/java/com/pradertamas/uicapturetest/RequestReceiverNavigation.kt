@@ -8,6 +8,19 @@ import android.content.Intent
 internal data class RequestReceiverTask(val bound: Boolean, val taskId: Int?)
 internal data class RequestReceiverRoute(val taskId: Int?, val flags: Int)
 
+/** Viewer-only return: no token, reserve, bootstrap or new signaling authority. */
+internal fun navigateActiveReceiver(activity: Activity, id: ReceiverSessionIdentity): Boolean {
+    if (!ReceiverSessions.canShow(id)) return false
+    val flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+    val intent = Intent(activity, ReceiverActivity::class.java).addFlags(flags)
+    return try {
+        val taskId = AppMediaRoles.receiverTask().taskId
+        val task = activity.getSystemService(ActivityManager::class.java).appTasks.firstOrNull { it.taskInfo?.taskId == taskId }
+        if (task != null) task.startActivity(activity, intent, null) else activity.startActivity(intent)
+        true
+    } catch (_: Exception) { false }
+}
+
 internal fun requestReceiverRoute(owner: RequestReceiverTask): RequestReceiverRoute? {
     // A bound owner without a task cannot safely be replaced with a second ViewModel.
     if (owner.bound && owner.taskId == null) return null
