@@ -10,7 +10,10 @@ import kotlinx.coroutines.launch
 
 internal class ConnectionRequestShareOwner
 internal enum class RequestShareError { UNAVAILABLE, CREATE_FAILED, CHOOSER_FAILED, LEGACY_STOP_FAILED }
-internal data class RequestShareUi(val busy: Boolean = false, val delivery: Long? = null, val error: RequestShareError? = null)
+internal data class RequestShareUi(val busy: Boolean = false, val delivery: Long? = null,
+    val error: RequestShareError? = null, val preparing: Boolean = false) {
+    val buttonLabel: String get() = if (preparing) "Preparing link..." else "Share connection link"
+}
 
 /** No Activity, Context, credentials, stored links, network client or timers.
  * start() must run at the main-thread Activity boundary. Its stop callback is synchronous
@@ -33,13 +36,14 @@ internal class ConnectionRequestShareCoordinator(
     fun start(owner: ConnectionRequestShareOwner, role: MediaRole, stopLegacy: () -> Unit) = synchronized(lock) {
         if (mutable.value.busy) return@synchronized
         val current = controller.state.value
-        if (current.operation != null || current.side == ConnectionRequestSide.RECIPIENT ||
+        val readOnlyStatus = current.operation == ConnectionRequestOperation.STATUS && controller.shareableInitiatorData(role) != null
+        if ((current.operation != null && !readOnlyStatus) || current.side == ConnectionRequestSide.RECIPIENT ||
             current.request?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING, ConnectionRequestState.CONNECTED)) {
             mutable.value = RequestShareUi(error = RequestShareError.UNAVAILABLE); return@synchronized
         }
         this.owner = owner; this.role = role
         attempt = null
-        mutable.value = RequestShareUi(busy = true)
+        mutable.value = RequestShareUi(busy = true, preparing = true)
         if (!legacyStartAllowed() && controller.shareableInitiatorData(role) != null) {
             mutable.value = RequestShareUi(busy = true, delivery = ++sequence)
             return@synchronized

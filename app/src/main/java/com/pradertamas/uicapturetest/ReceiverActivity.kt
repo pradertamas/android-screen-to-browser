@@ -197,7 +197,7 @@ class ReceiverActivity : ComponentActivity() {
                                     }
                                     if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                                     WorkflowStart(canChoose, selectedPath, share = requestShare.start,
-                                        shareEnabled = canChoose && !requestShare.busy) { path ->
+                                        shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label) { path ->
                                         if (path == ConnectionWorkflow.SHOW) model.ensureOwnCreate()
                                         if (path == ConnectionWorkflow.CONNECT && phase == ReceiverPhase.ENDED) model.retry()
                                         selectedPath = path

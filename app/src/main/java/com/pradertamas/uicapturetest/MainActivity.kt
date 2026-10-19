@@ -197,7 +197,7 @@ class MainActivity : ComponentActivity() {
                         }
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = requestShare.start,
-                            shareEnabled = canChoose && !requestShare.busy) { path ->
+                            shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label) { path ->
                             if (path == ConnectionWorkflow.SHOW && AppMediaRoles.role == MediaRole.SEND) {
                                 ConnectionRequestRuntimeGate.runLegacyStart {
                                     ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }

@@ -8,7 +8,7 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
-internal class RequestShareAction(val busy: Boolean, val message: String, val start: () -> Unit)
+internal class RequestShareAction(val busy: Boolean, val message: String, val label: String, val start: () -> Unit)
 
 @Composable
 internal fun rememberRequestShare(role: MediaRole, stopLegacy: () -> Unit): RequestShareAction {
@@ -33,12 +33,12 @@ internal fun rememberRequestShare(role: MediaRole, stopLegacy: () -> Unit): Requ
     }
     val message = when (ui.error) {
         RequestShareError.UNAVAILABLE -> "This connection cannot be shared right now."
-        RequestShareError.CREATE_FAILED -> "Connection link could not be created. Please try again."
+        RequestShareError.CREATE_FAILED -> "Couldn't prepare the connection link. Try again."
         RequestShareError.CHOOSER_FAILED -> "Link could not be shared. Please try again."
         RequestShareError.LEGACY_STOP_FAILED -> "Previous connection could not be stopped. Please try again."
-        null -> if (ui.busy && ui.delivery == null) "Preparing connection link..." else ""
+        null -> ""
     }
-    return RequestShareAction(ui.busy, message) {
+    return RequestShareAction(ui.busy, message, ui.buttonLabel) {
         check(Looper.myLooper() == Looper.getMainLooper())
         coordinator.start(owner, role, stopLegacy)
     }

@@ -27,7 +27,7 @@ class ShowConnectionTest {
         assertTrue(receiver.contains("ShowConnection.receiverReady(ui.home)"))
         assertTrue(receiver.contains("if (path == ConnectionWorkflow.SHOW) model.ensureOwnCreate()"))
         assertTrue(vm.contains("ShowConnection.ensureReceiver(state.value.home) { engine.create() }"))
-        val action = main.substringAfter("shareEnabled = canChoose && !requestShare.busy) { path ->").substringBefore("selectedPath = path")
+        val action = main.substringAfter("shareLabel = requestShare.label) { path ->").substringBefore("selectedPath = path")
         assertFalse(action.contains("createScreenCaptureIntent")); assertFalse(action.contains("startForegroundService"))
         assertFalse(receiver.contains("createScreenCaptureIntent"))
     }

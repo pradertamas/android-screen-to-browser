@@ -10,6 +10,66 @@ import java.util.concurrent.Executor
 import java.util.ArrayDeque
 
 class ConnectionRequestShareTest {
+    @Test fun foregroundStatusBetweenReadyAndChooserDoesNotLoseFirstShare() {
+        for (role in listOf(MediaRole.SEND, MediaRole.RECEIVE)) {
+            val f = Fixture(); f.start(role); f.finish()
+            val monitor = ConnectionRequestInitiatorMonitor(f.controller,
+                ConnectionRequestPollScheduler { _, _ -> {} }, { f.elapsed })
+            monitor.foreground(ConnectionRequestForegroundOwner(), role)
+            assertEquals(ConnectionRequestOperation.STATUS, f.controller.state.value.operation)
+            assertNotNull("Read-only foreground status must not invalidate a ready link", f.link(role))
+            assertEquals(1, f.creates)
+        }
+    }
+    @Test fun monitorStatusBeforeShareObserverStillOffersExactlyOneCompleteLink() {
+        val f = Fixture(); f.start(); f.queue.run() // CREATE complete, share observer has not run.
+        val monitor = ConnectionRequestInitiatorMonitor(f.controller,
+            ConnectionRequestPollScheduler { _, _ -> {} }, { f.elapsed })
+        monitor.foreground(ConnectionRequestForegroundOwner(), MediaRole.SEND)
+        f.coordinator.onRequestState(f.controller.state.value)
+        assertNull(f.ui.delivery)
+        f.finish() // Existing pre-delivery policy waits for the active GET's completion.
+        val delivery = f.ui.delivery!!
+        assertEquals("https://pairing.pradert.synology.me/connect#v=1&r=${token(16, 1)}&c=${token(16, 18)}&i=send", f.link())
+        assertNull(f.coordinator.takeLink(f.owner, delivery, MediaRole.SEND))
+        f.finish(); assertNull(f.ui.delivery); assertNull(f.ui.error); assertEquals(1, f.creates)
+    }
+    @Test fun explicitReshareDuringReadOnlyStatusUsesExistingLinkWithoutNewCreate() {
+        val f = Fixture(); f.start(); f.finish(); val original = f.link()
+        f.coordinator.chooserReturned(f.owner)
+        f.controller.refreshStatus()
+        f.start(); assertEquals(original, f.link()); assertNull(f.ui.error)
+        f.finish(); assertEquals(1, f.creates); assertEquals(0, f.cancels)
+    }
+    @Test fun pendingLabelSingleFlightAndChooserCancelReset() {
+        val f = Fixture()
+        assertEquals("Share connection link", f.ui.buttonLabel)
+        assertFalse(f.ui.busy); assertEquals(0, f.creates); assertTrue(f.queue.tasks.isEmpty())
+        f.start()
+        assertTrue(f.ui.preparing); assertTrue(f.ui.busy); assertEquals("Preparing link...", f.ui.buttonLabel)
+        repeat(3) { f.start() }; assertEquals(1, f.queue.tasks.size)
+        f.finish(); assertFalse(f.ui.preparing)
+        assertNotNull(f.link()); assertFalse(f.ui.preparing) // chooser opens; no preparing state.
+        f.coordinator.chooserReturned(f.owner) // Android chooser result includes cancel/back.
+        assertFalse(f.ui.busy); assertEquals("Share connection link", f.ui.buttonLabel)
+        assertEquals(1, f.creates)
+    }
+    @Test fun failedPreparationResetsButtonAndExplicitRetrySucceedsOnce() {
+        val f = Fixture(); f.createError = ConnectionRequestError.NETWORK
+        f.start(); f.finish()
+        assertFalse(f.ui.preparing); assertFalse(f.ui.busy)
+        assertEquals("Share connection link", f.ui.buttonLabel)
+        assertEquals(RequestShareError.CREATE_FAILED, f.ui.error); assertNull(f.link())
+        f.createError = null; f.start(); f.start(); f.finish()
+        assertNull(f.ui.error); assertNotNull(f.link()); assertNull(f.link()); assertEquals(2, f.creates)
+    }
+    @Test fun mutatingOperationStillBlocksShareExportAndStart() {
+        val f = Fixture(); f.start(); f.finish(); f.link(); f.coordinator.chooserReturned(f.owner)
+        f.controller.cancel()
+        assertNull(f.controller.shareableInitiatorData(MediaRole.SEND))
+        f.start(); assertEquals(RequestShareError.UNAVAILABLE, f.ui.error); assertNull(f.ui.delivery)
+        assertEquals(1, f.creates)
+    }
     private fun token(bytes: Int, seed: Int) = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(bytes) { seed.toByte() })
     private class Queue : Executor {
         val tasks = ArrayDeque<Runnable>()

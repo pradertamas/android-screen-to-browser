@@ -177,7 +177,10 @@ class ConnectionRequestController(
         expectedCreateAttempt: ConnectionRequestCreateAttempt? = null): ConnectionRequestShareData? = synchronized(lock) {
         val c = context ?: return@synchronized null
         val m = c.metadata ?: return@synchronized null
-        if (activeOperation != null || c.side != ConnectionRequestSide.INITIATOR || c.role != role ||
+        // STATUS reads metadata; it must not hide an already-created WAITING link.
+        // Mutating operations still block explicit share access.
+        if ((activeOperation != null && activeOperation != ConnectionRequestOperation.STATUS) ||
+            c.side != ConnectionRequestSide.INITIATOR || c.role != role ||
             m.state != ConnectionRequestState.WAITING || m.expiresAt == null) return@synchronized null
         if (expectedCreateAttempt != null && c.originAttempt !== expectedCreateAttempt) return@synchronized null
         val deadline = c.expiryElapsedMs ?: return@synchronized null
