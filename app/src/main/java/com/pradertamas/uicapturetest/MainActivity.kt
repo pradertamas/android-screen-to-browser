@@ -98,6 +98,7 @@ class MainActivity : ComponentActivity() {
                 PairingHost.controller.hide()
                 PairingHost.controller.close()
             }
+            val legacyAllowed by ConnectionRequestRuntimeGate.allowed.collectAsState()
             var diagnostics by remember { mutableStateOf(false) }
             var scanning by remember { mutableStateOf(false) }
             val home by PairingHost.state.collectAsState()
@@ -198,24 +199,39 @@ class MainActivity : ComponentActivity() {
                         if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                         if (!rtc.busy) WorkflowStart(canChoose, selectedPath, share = requestShare.start,
                             shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label) { path ->
-                            if (path == ConnectionWorkflow.SHOW && AppMediaRoles.role == MediaRole.SEND) {
-                                ConnectionRequestRuntimeGate.runLegacyStart {
-                                    ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
-                                }
+                            if (!requestShare.busy) {
+                                val entry = enterManualConnection(ConnectionRequests.controller, MediaRole.SEND,
+                                    RequestMediaLifecycle.coordinator::requestExit)
+                                if (entry == ManualConnectionEntry.BLOCKED)
+                                    remoteFeedback = "Another connection request is active. Close it before using a code."
+                                else selectedPath = path
                             }
-                            if (path == ConnectionWorkflow.CONNECT && home.phase == PairingPhase.STOPPED)
-                                ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
-                            selectedPath = path
                         }
                         if (requestShare.message.isNotEmpty()) Text(requestShare.message)
                         if (remoteFeedback != "Remote link ready") Text(remoteFeedback)
                         }
                         if (activePath != null) WorkflowPanel(activePath, canChoose, closeTask) {
+                            LaunchedEffect(activePath, legacyAllowed, lifecycleState, mediaMode.role) {
+                                if (selectedPath != null && canChoose && legacyAllowed && lifecycleState == Lifecycle.State.RESUMED &&
+                                    mediaMode.role == MediaRole.SEND && ConnectionRequests.controller.mediaSnapshot() == null) {
+                                    ConnectionRequestRuntimeGate.runLegacyStart {
+                                        if (activePath == ConnectionWorkflow.SHOW)
+                                            ShowConnection.ensureSender(PairingHost.state.value) { PairingHost.controller.create() }
+                                        else if (PairingHost.state.value.phase == PairingPhase.STOPPED) PairingHost.controller.show()
+                                    }
+                                }
+                            }
+                            if (!legacyAllowed) Text("Closing the shared connection link before using a code...")
                             if (activePath == ConnectionWorkflow.SHOW && ShowConnection.senderReady(home) && !rtc.busy) {
                                 WorkflowOwnCode(home.code)
                             }
-                            if (activePath == ConnectionWorkflow.CONNECT && PairingHost.controller.editable() && !rtc.busy) {
-                            Button(modifier = Modifier.fillMaxWidth(), enabled = !state.busy && !scanning, onClick = {
+                            if (activePath == ConnectionWorkflow.SHOW && canChoose && !ShowConnection.senderReady(home)) {
+                                Text("Connection code")
+                                Text("Preparing connection code...")
+                            }
+                            if (activePath == ConnectionWorkflow.CONNECT && !rtc.busy) {
+                            val editable = legacyAllowed && PairingHost.controller.editable()
+                            Button(modifier = Modifier.fillMaxWidth(), enabled = editable && !state.busy && !scanning, onClick = {
                                 PairingHost.controller.typed("")
                                 scanning = true
                                 externalUi = true
@@ -244,6 +260,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 } catch (_: Exception) { scanning = false; externalUi = false; PairingHost.controller.notice("Camera is not available. Enter the connection code instead.") }
                             }) { Text(if (scanning) "Scanning..." else "Scan QR code") }
+                            Text("OR")
                             OutlinedTextField(value = joinCode, onValueChange = { value ->
                                 val normalized = AutoPairing.input(value)
                                 if (normalized != null) {
@@ -253,8 +270,8 @@ class MainActivity : ComponentActivity() {
                                     PairingHost.controller.typed("")
                                     PairingHost.controller.notice("Invalid connection code")
                                 }
-                            }, enabled = !scanning, label = { Text("Connection code") }, singleLine = true)
-                            Button(modifier = Modifier.fillMaxWidth(), enabled = !scanning && !state.busy, onClick = {
+                            }, enabled = editable && !scanning, label = { Text("Connection code") }, singleLine = true)
+                            Button(modifier = Modifier.fillMaxWidth(), enabled = editable && !scanning && !state.busy, onClick = {
                                 val code = PairingCode.normalize(joinCode)
                                 if (code != null) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.join(code) }
                                 else PairingHost.controller.notice("Invalid connection code")

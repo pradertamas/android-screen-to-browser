@@ -10,6 +10,64 @@ import java.util.concurrent.Executor
 import java.util.ArrayDeque
 
 class ConnectionRequestShareTest {
+    @Test fun shareThenEitherManualPathCancelsExactWaitingRequestBeforeLegacyStarts() {
+        for (role in MediaRole.entries) for (path in listOf(ConnectionWorkflow.CONNECT, ConnectionWorkflow.SHOW)) {
+            val f = Fixture(); f.start(role); f.finish(); assertNotNull(f.link(role))
+            f.coordinator.chooserReturned(f.owner)
+            assertFalse(f.gate.legacyStartAllowed())
+            val lifecycle = ConnectionRequestMediaLifecycle(f.controller, f.gate::releaseRequestFirst)
+            var registrations = 0
+            val legacy = AutoPairing(object : PairingTransport {
+                override fun open(code: String, intent: PairingIntent, message: (String, String, String) -> Unit,
+                    ended: () -> Unit): PairingLink {
+                    registrations++; message("registration", "ok", "")
+                    return object : PairingLink { override fun send(text: String) = true; override fun close() {} }
+                }
+            }, { _, _ -> {} }, {}, { "ABC234" })
+            assertEquals(ManualConnectionEntry.CLOSING_LINK, enterManualConnection(f.controller, role, lifecycle::requestExit))
+            f.gate.runLegacyStart { legacy.show() }
+            assertEquals(PairingPhase.STOPPED, legacy.home.phase); assertEquals(0, registrations)
+            f.queue.run(); lifecycle.changed()
+            assertEquals(1, f.cancels); assertTrue(f.gate.legacyStartAllowed())
+            f.gate.runLegacyStart {
+                if (path == ConnectionWorkflow.SHOW) ShowConnection.ensureSender(legacy.home) { legacy.create() }
+                else legacy.show()
+            }
+            assertTrue(legacy.editable()); assertTrue(ShowConnection.senderReady(legacy.home)); assertEquals(1, registrations)
+        }
+    }
+    @Test fun failedManualTransitionKeepsGateAndRequiresExactExplicitRetry() {
+        val f = Fixture(); f.start(); f.finish(); f.link(); f.coordinator.chooserReturned(f.owner)
+        f.cancelError = ConnectionRequestError.NETWORK
+        val lifecycle = ConnectionRequestMediaLifecycle(f.controller, f.gate::releaseRequestFirst)
+        enterManualConnection(f.controller, MediaRole.SEND, lifecycle::requestExit)
+        f.queue.run(); lifecycle.changed()
+        assertFalse(f.gate.legacyStartAllowed()); assertTrue(lifecycle.state.value.retry)
+        repeat(3) { enterManualConnection(f.controller, MediaRole.SEND, lifecycle::requestExit) }
+        assertTrue(f.queue.tasks.isEmpty()); assertEquals(1, f.cancels)
+        f.cancelError = null; lifecycle.retry(lifecycle.state.value.retryTarget!!)
+        f.queue.run(); lifecycle.changed(); assertTrue(f.gate.legacyStartAllowed())
+    }
+    @Test fun manualTransitionWaitsForInflightStatusAndDoesNotAdoptPendingCreate() {
+        val f = Fixture(); f.start()
+        assertEquals(ManualConnectionEntry.BLOCKED, enterManualConnection(f.controller, MediaRole.SEND) { error("exit") })
+        f.finish(); f.link(); f.coordinator.chooserReturned(f.owner)
+        f.controller.refreshStatus()
+        val lifecycle = ConnectionRequestMediaLifecycle(f.controller, f.gate::releaseRequestFirst)
+        assertEquals(ManualConnectionEntry.CLOSING_LINK, enterManualConnection(f.controller, MediaRole.SEND, lifecycle::requestExit))
+        assertEquals(0, f.cancels); assertFalse(f.gate.legacyStartAllowed())
+        f.queue.run(); lifecycle.changed() // Status finishes; existing lifecycle admits cancel.
+        f.queue.run(); lifecycle.changed()
+        assertEquals(1, f.cancels); assertTrue(f.gate.legacyStartAllowed())
+    }
+    @Test fun manualNavigationCannotExitRecipientAcceptedOrWrongRoleRequests() {
+        val f = Fixture(); f.start(); f.finish()
+        assertEquals(ManualConnectionEntry.BLOCKED, enterManualConnection(f.controller, MediaRole.RECEIVE) { error("exit") })
+        f.serverState = ConnectionRequestState.ACCEPTED; f.controller.refreshStatus(); f.queue.run()
+        assertEquals(ManualConnectionEntry.BLOCKED, enterManualConnection(f.controller, MediaRole.SEND) { error("exit") })
+        f.controller.clear(); f.controller.preview(token(16, 1), token(16, 2), MediaRole.SEND)
+        assertEquals(ManualConnectionEntry.BLOCKED, enterManualConnection(f.controller, MediaRole.RECEIVE) { error("exit") })
+    }
     @Test fun foregroundStatusBetweenReadyAndChooserDoesNotLoseFirstShare() {
         for (role in listOf(MediaRole.SEND, MediaRole.RECEIVE)) {
             val f = Fixture(); f.start(role); f.finish()

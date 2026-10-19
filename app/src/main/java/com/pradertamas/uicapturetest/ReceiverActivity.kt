@@ -140,6 +140,7 @@ class ReceiverActivity : ComponentActivity() {
                 }
             }
             val requestShare = rememberRequestShare(mediaMode.role) { model.stop() }
+            val legacyAllowed by ConnectionRequestRuntimeGate.allowed.collectAsState()
             val phase = ui.home.phase
             var selectedPath by rememberSaveable { mutableStateOf<String?>(null) }
             var code by rememberSaveable { mutableStateOf("") }
@@ -198,26 +199,44 @@ class ReceiverActivity : ComponentActivity() {
                                     if (mediaMode.error.isNotEmpty()) Text(mediaMode.error)
                                     WorkflowStart(canChoose, selectedPath, share = requestShare.start,
                                         shareEnabled = canChoose && !requestShare.busy, shareLabel = requestShare.label) { path ->
-                                        if (path == ConnectionWorkflow.SHOW) model.ensureOwnCreate()
-                                        if (path == ConnectionWorkflow.CONNECT && phase == ReceiverPhase.ENDED) model.retry()
-                                        selectedPath = path
+                                        if (!requestShare.busy) {
+                                            val entry = enterManualConnection(ConnectionRequests.controller, MediaRole.RECEIVE,
+                                                RequestMediaLifecycle.coordinator::requestExit)
+                                            if (entry == ManualConnectionEntry.BLOCKED)
+                                                error = "Another connection request is active. Close it before using a code."
+                                            else selectedPath = path
+                                        }
                                     }
                                     if (requestShare.message.isNotEmpty()) Text(requestShare.message)
                                     if (selectedPath == null && error.isNotEmpty()) Text(error)
                                     }
                                     if (activePath != null && model.requestFlow == null) WorkflowPanel(activePath, canChoose, closeTask) {
-                                        if (phase == ReceiverPhase.PAIRING) {
+                                        LaunchedEffect(activePath, legacyAllowed, lifecycleState, mediaMode.role) {
+                                            if (selectedPath != null && canChoose && legacyAllowed && lifecycleState == androidx.lifecycle.Lifecycle.State.RESUMED &&
+                                                mediaMode.role == MediaRole.RECEIVE && ConnectionRequests.controller.mediaSnapshot() == null) {
+                                                if (activePath == ConnectionWorkflow.SHOW) model.ensureOwnCreate()
+                                                if (activePath == ConnectionWorkflow.CONNECT && model.state.value.home.phase == ReceiverPhase.ENDED) model.retry()
+                                            }
+                                        }
+                                        if (!legacyAllowed) Text("Closing the shared connection link before using a code...")
+                                        if (activePath == ConnectionWorkflow.SHOW && canChoose && !ShowConnection.receiverReady(ui.home)) {
+                                            Text("Connection code")
+                                            Text("Preparing connection code...")
+                                        }
+                                        if (phase != ReceiverPhase.RECEIVING) {
                                             if (activePath == ConnectionWorkflow.SHOW && ShowConnection.receiverReady(ui.home)) {
                                                 WorkflowOwnCode(ui.home.code)
                                             }
                                             if (activePath == ConnectionWorkflow.CONNECT) {
-                                                Button(modifier = Modifier.fillMaxWidth(), enabled = !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
+                                                val editable = legacyAllowed && phase == ReceiverPhase.PAIRING
+                                                Button(modifier = Modifier.fillMaxWidth(), enabled = editable && !scanning, onClick = { scanCode({ scanned -> code = ""; error = ""; model.join(scanned) }, { error = it }) }) { Text("Scan QR code") }
+                                                Text("OR")
                                                 OutlinedTextField(code, { value ->
                                                     val normalized = AutoPairing.input(value)
                                                     if (normalized != null) { code = normalized; error = "" }
                                                     else error = "Invalid connection code"
-                                                }, enabled = !scanning, label = { Text("Connection code") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                                                Button(enabled = !scanning, modifier = Modifier.fillMaxWidth(), onClick = { if (!model.join(code)) error = "Invalid connection code" }) { Text("Connect") }
+                                                }, enabled = editable && !scanning, label = { Text("Connection code") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                                                Button(enabled = editable && !scanning, modifier = Modifier.fillMaxWidth(), onClick = { if (!model.join(code)) error = "Invalid connection code" }) { Text("Connect") }
                                             }
                                         }
                                         if (phase == ReceiverPhase.CONNECTING) Text(ConnectionWorkflow.displayStatus(ui.home.status))

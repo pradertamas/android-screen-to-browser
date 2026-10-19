@@ -37,6 +37,16 @@ presentation path according to the existing media/consent guards. Receiver rende
 rotation retention, first-frame handling and sender MediaProjection are unchanged.
 The independent sender #device remote-link capability remains unchanged.
 
+Choosing Connect or Show after returning from Share explicitly leaves the idle
+WAITING initiator link: its exact request is canceled through the existing media
+cleanup coordinator before the legacy registration starts. This invalidates that
+shared link only when the user chooses the alternative connection method, not when
+the chooser is dismissed. The request gate is never released blindly. Cleanup error
+retains authority/gate and uses the existing exact-target retry. Other recipient,
+accepted or active media contexts cannot be exited by this navigation action.
+During the transition Connect keeps scanner/code/Connect controls visible but
+disabled; Show explains code preparation until a real accepted code is available.
+
 ## Android App Links and configuration
 
 The sole external VIEW connection entry is ConnectionRequestActivity with HTTPS,
