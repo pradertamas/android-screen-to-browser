@@ -37,8 +37,12 @@ class ReceiverActivity : ComponentActivity() {
         val attached = ::model.isInitialized && model.ensureBoundToTask(taskId)
         if (id == null) return
         RequestMediaLifecycle.coordinator
-        if (!attached || !model.startRequest(id))
+        if (!attached || !model.startRequest(id)) {
+            RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_HANDOFF_REJECTED, role = AppMediaRoles.role,
+                state = ConnectionRequests.controller.state.value)
             ConnectionRequestMediaHandoff.process.reject(id, RequestMediaLifecycle.coordinator::requestExit)
+        } else RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_HANDOFF_ACCEPTED, model.requestIdentity,
+            AppMediaRoles.role, ConnectionRequests.controller.state.value)
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -58,6 +62,12 @@ class ReceiverActivity : ComponentActivity() {
         super.onPause()
     }
     private lateinit var model: ReceiverViewModel
+    private fun finishReceiver() {
+        RequestFlowTrace.record(RequestFlowTrace.Event.FINISH_RECEIVER_RETURN,
+            if (::model.isInitialized) model.requestIdentity else null,
+            AppMediaRoles.role, ConnectionRequests.controller.state.value)
+        finish()
+    }
     private var renderer: SurfaceViewRenderer? = null
     private var scanning by mutableStateOf(false)
     private fun scanCode(done: (String) -> Unit, failure: (String) -> Unit) {
@@ -87,15 +97,15 @@ class ReceiverActivity : ComponentActivity() {
             val current = ConnectionRequests.controller.mediaSnapshot()
             if (current != null && current.flow !== owned &&
                 current.phase in setOf(RequestMediaPhase.RESERVED, RequestMediaPhase.STARTED)) {
-                model.stopRequest(owned); finish(); return
+                model.stopRequest(owned); finishReceiver(); return
             }
         }
         if (::model.isInitialized) model.requestFlow?.let { flow ->
             val current = ConnectionRequests.controller.mediaSnapshot()?.flow
             model.stopRequest(flow)
-            if (current != null && current !== flow) { finish(); return }
+            if (current != null && current !== flow) { finishReceiver(); return }
         }
-        if (AppMediaRoles.switchRole(MediaRole.SEND, stopActive)) finish()
+        if (AppMediaRoles.switchRole(MediaRole.SEND, stopActive)) finishReceiver()
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -105,21 +115,27 @@ class ReceiverActivity : ComponentActivity() {
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)
         enableEdgeToEdge()
         if (AppMediaRoles.role != MediaRole.RECEIVE) {
+            RequestFlowTrace.record(RequestFlowTrace.Event.FALLBACK_ROLE_NOT_RECEIVE, role = AppMediaRoles.role,
+                state = ConnectionRequests.controller.state.value)
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             // Process recreation defaults to SEND; never infer RECEIVE from the restored Activity type.
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-            finish(); return
+            finishReceiver(); return
         }
         try { model = ViewModelProvider(this)[ReceiverViewModel::class.java] }
         catch (_: Exception) {
+            RequestFlowTrace.record(RequestFlowTrace.Event.FALLBACK_VIEWMODEL_FAILED, role = AppMediaRoles.role,
+                state = ConnectionRequests.controller.state.value)
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             AppMediaRoles.receiverStartFailed()
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-            finish(); return
+            finishReceiver(); return
         }
         if (!model.ensureBoundToTask(taskId)) {
+            RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_ATTACH_FAILED, role = AppMediaRoles.role,
+                state = ConnectionRequests.controller.state.value)
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
-            finish(); return
+            finishReceiver(); return
         }
         deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {

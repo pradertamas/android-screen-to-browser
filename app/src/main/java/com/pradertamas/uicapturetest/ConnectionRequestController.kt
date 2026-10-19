@@ -113,6 +113,9 @@ class ConnectionRequestController(
             // A newer request may have superseded this queued operation before it started.
             if (!synchronized(lock) { generation == token }) return@execute
             val result = safe { api.create(role) }
+            RequestFlowTrace.record(RequestFlowTrace.Event.HTTP_COMPLETE, attempt, role,
+                ConnectionRequestUiState(ConnectionRequestSide.INITIATOR, result.created?.metadata,
+                    ConnectionRequestOperation.CREATE, result.error), code = result.httpStatus)
             var abandoned: ConnectionRequestCreated? = null
             synchronized(lock) {
                 if (generation != token) abandoned = result.created
@@ -412,6 +415,10 @@ class ConnectionRequestController(
         worker.execute {
             if (!synchronized(lock) { generation == token && context === c }) return@execute
             val result = safe { call(c) }
+            // Worker boundary, outside controller lock. Whitelist metadata, never log auth/body.
+            RequestFlowTrace.record(RequestFlowTrace.Event.HTTP_COMPLETE, c.originAttempt ?: c.recipientFlow,
+                role = if (c.side == ConnectionRequestSide.INITIATOR) c.role else ConnectionRequestSetupCoordinator.opposite(c.role),
+                state = ConnectionRequestUiState(c.side, result.metadata, op, result.error), code = result.httpStatus)
             synchronized(lock) {
                 if (generation != token || context !== c) return@synchronized
                 activeOperation = null

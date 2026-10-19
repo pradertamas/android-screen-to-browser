@@ -174,6 +174,7 @@ class RequestMediaTest {
         val f = Fixture(); val flow: Any = if (recipient) f.recipient() else f.initiator(MediaRole.RECEIVE)
         val factory = Factory(); val q = Queue(); val timers = mutableListOf<Long>(); var generated = 0; var media = 0; var disposed = 0
         val receivedIce = mutableListOf<ReceiverIce>()
+        val scheduled = mutableMapOf<Any, Pair<Long, () -> Unit>>()
         var localIce: ((ReceiverIce) -> Unit)? = null
         var mediaFailure: (() -> Unit)? = null
         val legacy = object : ReceiverWire {
@@ -186,7 +187,11 @@ class RequestMediaTest {
             override fun offer(sdp: String, remoteReady: () -> Unit, answer: (String) -> Unit, failure: () -> Unit) { remoteReady(); answer("answer") }
             override fun ice(candidate: ReceiverIce) { receivedIce.add(candidate) }
             override fun close() { disposed++ }
-        } }, { ms, _ -> timers.add(ms); {} }, {}, { generated++; "ABC234" })
+        } }, { ms, action ->
+            timers.add(ms)
+            val key = Any(); scheduled[key] = ms to action
+            val cancel: () -> Unit = { scheduled.remove(key); Unit }; cancel
+        }, {}, { generated++; "ABC234" })
         val owner = RequestReceiverOwner(engine, router, f.handoffs, q::dispatch, factory)
         fun start() { assertTrue(owner.start(f.handoffs.reserve(flow, MediaRole.RECEIVE)!!)) }
         fun register() { factory.register(MediaRole.RECEIVE, if (flow is ConnectionRequestRecipientFlow) PairingIntent.JOIN else PairingIntent.CREATE); q.run() }
@@ -203,6 +208,33 @@ class RequestMediaTest {
         r.factory.listener.text("""{"type":"offer","sdp":"offer"}"""); r.q.run()
         assertEquals(1, r.media); assertEquals("answer", JSONObject(r.factory.socket.sent.last()).getString("type"))
         r.factory.text("bye"); r.q.run(); assertFalse(r.owner.active); assertEquals(1, r.disposed)
+    }
+    @Test fun authenticatedJoinWaitsPastRegistrationDeadlineWithoutTeardownOrSecondSocket() {
+        val r = ReceiverFixture(true); r.start()
+        assertEquals(listOf(15000L), r.scheduled.values.map { it.first })
+        r.register() // Relay now acknowledges authenticated JOIN before CREATE exists.
+        assertTrue(r.scheduled.isEmpty()) // No 15-second timeout while the user considers consent.
+        assertEquals(ReceiverPhase.PAIRING, r.engine.home.phase)
+        assertTrue(r.owner.active); assertEquals(0, r.media)
+        repeat(4) { assertFalse(r.owner.start("duplicate")) }
+        assertEquals(1, r.factory.opens); assertEquals(0, r.f.withdraws); assertEquals(0, r.f.cancels)
+        r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"after-consent"}"""); r.q.run()
+        r.engine.firstFrame()
+        assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+        assertTrue(r.owner.active); assertEquals(1, r.media); assertEquals(1, r.factory.opens)
+        assertEquals("answer", JSONObject(r.factory.socket.sent.last()).getString("type"))
+    }
+    @Test fun receiverNavigationRequiresEffectiveReceiveRoleBeforeDispatch() {
+        val r = ReceiverFixture(true); var navigations = 0
+        assertFalse(startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.SEND, true, {}) {
+            navigations++; true
+        })
+        assertEquals(0, navigations); assertNull(r.f.controller.mediaPhaseForFlow(r.flow))
+        assertTrue(startRequestReceiver(r.f.controller, r.f.handoffs, r.flow, true, MediaRole.RECEIVE, true, {}) {
+            navigations++; true
+        })
+        assertEquals(1, navigations)
     }
     @Test fun receiverAnswerInboundFailsClosed() {
         val r = ReceiverFixture(); r.start(); r.register()
@@ -903,6 +935,6 @@ class RequestMediaTest {
         assertTrue(receiver.contains("override fun onNewIntent")); assertTrue(receiver.contains("removeExtra(REQUEST_MEDIA_HANDOFF)"))
         assertTrue(receiver.contains("renderer?.let(model::detach)")); assertTrue(receiver.contains("model.attach(it)"))
         val recipient = java.io.File(base, "ConnectionRequestActivity.kt").readText()
-        assertTrue(recipient.contains("model.mediaTransferred = true; finish()"))
+        assertTrue(recipient.contains("model.mediaTransferred = true; finishRequest(RequestFlowTrace.Event.FINISH_RECEIVER_TRANSFER)"))
     }
 }

@@ -35,11 +35,19 @@ internal fun <T> dispatchRequestReceiver(route: RequestReceiverRoute, tasks: () 
  * Missing warm task fails closed; it never creates a competing receiver owner.
  */
 internal fun navigateRequestReceiver(activity: Activity, id: RequestMediaHandoffId): Boolean {
-    val route = requestReceiverRoute(AppMediaRoles.receiverTask()) ?: return false
+    val flow = ConnectionRequestMediaHandoff.process.flowFor(id.value)
+    RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_DISPATCH, flow, AppMediaRoles.role, ConnectionRequests.controller.state.value)
+    val route = requestReceiverRoute(AppMediaRoles.receiverTask()) ?: run {
+        RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_DISPATCH_FAILED, flow, AppMediaRoles.role)
+        return false
+    }
     val intent = Intent(activity, ReceiverActivity::class.java).addFlags(route.flags)
         .putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value)
-    return dispatchRequestReceiver(route,
+    val dispatched = dispatchRequestReceiver(route,
         { activity.getSystemService(ActivityManager::class.java).appTasks },
         { it.taskInfo?.taskId }, { task, _ -> task.startActivity(activity, intent, null) },
         { activity.startActivity(intent) })
+    RequestFlowTrace.record(if (dispatched) RequestFlowTrace.Event.RECEIVER_DISPATCHED else RequestFlowTrace.Event.RECEIVER_DISPATCH_FAILED,
+        flow, AppMediaRoles.role, ConnectionRequests.controller.state.value)
+    return dispatched
 }

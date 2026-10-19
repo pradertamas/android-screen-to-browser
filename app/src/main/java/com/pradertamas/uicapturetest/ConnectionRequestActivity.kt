@@ -20,6 +20,10 @@ class ConnectionRequestActivity : ComponentActivity() {
     private lateinit var model: ConnectionRequestActivityViewModel
     private lateinit var requestSender: RequestSenderLaunchViewModel
     private val setupOwner = ConnectionRequestSetupOwner()
+    private fun finishRequest(reason: RequestFlowTrace.Event) {
+        RequestFlowTrace.record(reason, model.flow, AppMediaRoles.role, ConnectionRequests.controller.state.value)
+        finish()
+    }
     override fun onResume() {
         super.onResume()
         model.flow?.let { ConnectionRequestSetup.coordinator.foreground(setupOwner, it) }
@@ -48,7 +52,9 @@ class ConnectionRequestActivity : ComponentActivity() {
         if (model.flow == null) incoming(intent) else { intent.data = null }
         setContent {
             val flow = model.flow
-            RequestSenderConsent(this, requestSender, flow) { model.mediaTransferred = true; finish() }
+            RequestSenderConsent(this, requestSender, flow) {
+                model.mediaTransferred = true; finishRequest(RequestFlowTrace.Event.FINISH_SENDER_TRANSFER)
+            }
             val request by ConnectionRequests.controller.state.collectAsState()
             val mediaRevision by ConnectionRequests.controller.mediaChanges.collectAsState()
             val life by lifecycle.currentStateFlow.collectAsState()
@@ -57,7 +63,9 @@ class ConnectionRequestActivity : ComponentActivity() {
             val hasFlow = flow != null
             val media by AppMediaRoles.state.collectAsState()
             LaunchedEffect(flow, request, mediaRevision, life, media.role, model.exiting) {
-                if (model.exiting && ConnectionRequests.controller.mediaSnapshot()?.flow !== flow) { finish(); return@LaunchedEffect }
+                if (model.exiting && ConnectionRequests.controller.mediaSnapshot()?.flow !== flow) {
+                    finishRequest(RequestFlowTrace.Event.FINISH_EXIT_COMPLETE); return@LaunchedEffect
+                }
                 if (flow != null && !model.mediaTransferred && !model.exiting) {
                     val started = startRequestReceiver(ConnectionRequests.controller, ConnectionRequestMediaHandoff.process,
                         flow, life == androidx.lifecycle.Lifecycle.State.RESUMED, media.role,
@@ -65,7 +73,7 @@ class ConnectionRequestActivity : ComponentActivity() {
                         model.receiverTransfer) { id ->
                         navigateRequestReceiver(this@ConnectionRequestActivity, id)
                     }
-                    if (started) { model.mediaTransferred = true; finish() }
+                    if (started) { model.mediaTransferred = true; finishRequest(RequestFlowTrace.Event.FINISH_RECEIVER_TRANSFER) }
                 }
             }
             val receiverRevision by AppMediaRoles.receiverRevision.collectAsState()
@@ -73,7 +81,9 @@ class ConnectionRequestActivity : ComponentActivity() {
             val capture by CaptureState.state.collectAsState()
             val rtc by WebRtcState.state.collectAsState()
             val idle = remember(media.role, receiverRevision, sender.phase, capture.busy, rtc.busy) { AppMediaRoles.pairingAllowed() }
-            LaunchedEffect(hasFlow, ui.screen) { if (hasFlow && ui.screen == RecipientScreen.FINISHED) finish() }
+            LaunchedEffect(hasFlow, ui.screen) {
+                if (hasFlow && ui.screen == RecipientScreen.FINISHED) finishRequest(RequestFlowTrace.Event.FINISH_CLOSED)
+            }
             BackHandler { closeOwned() }
             UICaptureTestTheme {
                 Surface {
@@ -82,7 +92,7 @@ class ConnectionRequestActivity : ComponentActivity() {
                         RequestCleanupRetry(flow, scoped = true)
                         if (!hasFlow) {
                             Text(entryText(entryError ?: RecipientEntryError.INVALID))
-                            TextButton(onClick = { finish() }) { Text("Close") }
+                            TextButton(onClick = { finishRequest(RequestFlowTrace.Event.FINISH_NO_CONTEXT) }) { Text("Close") }
                         } else {
                             ui.initiatorRole?.let { role ->
                                 Text(if (role == MediaRole.SEND) "Another device wants to share its screen with this device."
@@ -111,8 +121,8 @@ class ConnectionRequestActivity : ComponentActivity() {
     }
     private fun closeOwned() {
         val flow = model.flow
-        if (model.mediaTransferred || !model.receiverTransfer.cancel()) { finish(); return }
-        if (flow == null || !coordinator.hasContext(flow)) { finish(); return }
+        if (model.mediaTransferred || !model.receiverTransfer.cancel()) { finishRequest(RequestFlowTrace.Event.FINISH_CLOSED); return }
+        if (flow == null || !coordinator.hasContext(flow)) { finishRequest(RequestFlowTrace.Event.FINISH_NO_CONTEXT); return }
         val s = ConnectionRequests.controller.mediaSnapshot()
         if (s?.flow === flow && s.won && s.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) {
             ConnectionRequestSetup.coordinator.suspendRecipient(flow)

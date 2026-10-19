@@ -75,6 +75,7 @@ internal class ProtectedRequestSignaling private constructor(
     private var socket: ProtectedSocket? = null
     private val role = checkNotNull(bootstrap).role
     private val intent = checkNotNull(bootstrap).intent
+    private val traceFlow = checkNotNull(bootstrap).flow
     private var present = false
     private val pending = ArrayDeque<() -> Unit>()
     private var draining = false
@@ -109,6 +110,8 @@ internal class ProtectedRequestSignaling private constructor(
         if (ended) return
         phase = if (failure) Phase.FAILED else Phase.CLOSED
         bootstrap = null; pending.clear()
+        add { RequestFlowTrace.record(if (failure) RequestFlowTrace.Event.TRANSPORT_FAILED else RequestFlowTrace.Event.TRANSPORT_CLOSED,
+            traceFlow, role, intent = intent) }
         val closing = socket
         if (failure || local) add {
             runCatching { closing?.close(if (failure) 1008 else 1000) }
@@ -130,7 +133,10 @@ internal class ProtectedRequestSignaling private constructor(
             if (auth == null || auth.toByteArray(Charsets.UTF_8).size > 512) failed()
             else {
                 val admitted = synchronized(lock) { !ended && this@ProtectedRequestSignaling.socket === socket }
-                if (admitted && !runCatching { socket.send(auth) }.getOrDefault(false)) failed()
+                if (admitted) {
+                    RequestFlowTrace.record(RequestFlowTrace.Event.AUTH_SENT, traceFlow, role, intent = intent)
+                    if (!runCatching { socket.send(auth) }.getOrDefault(false)) failed()
+                }
             }
         }
     }
@@ -143,14 +149,30 @@ internal class ProtectedRequestSignaling private constructor(
             if (phase == Phase.AUTH_SENT) {
                 if (type != "registration" || m.opt("status") != "ok" || m.opt("remotePresence") != false ||
                     m.opt("role") != role.signalingRole || m.opt("intent") != intent.wire ||
-                    m.keys().asSequence().toSet() != setOf("type", "status", "role", "intent", "remotePresence")) { terminal(true); return@change }
-                phase = Phase.REGISTERED; pending.add { events.registered() }; return@change
+                    m.keys().asSequence().toSet() != setOf("type", "status", "role", "intent", "remotePresence")) {
+                    val result = when (m.opt("status")) {
+                        "not-found" -> RequestFlowTrace.Event.REGISTER_NOT_FOUND
+                        "conflict" -> RequestFlowTrace.Event.REGISTER_CONFLICT
+                        "role-occupied" -> RequestFlowTrace.Event.REGISTER_ROLE_OCCUPIED
+                        "rate-limited" -> RequestFlowTrace.Event.REGISTER_RATE_LIMITED
+                        else -> RequestFlowTrace.Event.REGISTER_REJECTED
+                    }
+                    add { RequestFlowTrace.record(result, traceFlow, role, intent = intent) }
+                    terminal(true); return@change
+                }
+                phase = Phase.REGISTERED
+                add { RequestFlowTrace.record(RequestFlowTrace.Event.REGISTER_OK, traceFlow, role, intent = intent) }
+                pending.add { events.registered() }; return@change
             }
             if (phase != Phase.REGISTERED) { terminal(true); return@change }
             when (type) {
                 "peer-present" -> {
                     if (m.length() != 1) { terminal(true); return@change }
-                    if (!present) { present = true; pending.add { events.peerPresent() } }
+                    if (!present) {
+                        present = true
+                        add { RequestFlowTrace.record(RequestFlowTrace.Event.PEER_PRESENT, traceFlow, role, intent = intent) }
+                        pending.add { events.peerPresent() }
+                    }
                 }
                 "peer-left", "bye" -> {
                     if (m.length() != 1) { terminal(true); return@change }
@@ -180,12 +202,17 @@ internal class ProtectedRequestSignaling private constructor(
         return sent
     }
     override fun binary() = change { terminal(true) }
-    override fun failed() = change { terminal(true) }
+    override fun failed() = change {
+        if (!ended) add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_FAILURE, traceFlow, role, intent = intent) }
+        terminal(true)
+    }
     override fun closed(code: Int) = change {
         if (ended) return@change
+        add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_REMOTE_CLOSE, traceFlow, role, intent = intent, code = code) }
         terminal(code != 1000 || phase != Phase.REGISTERED)
     }
     fun close() = change {
+        if (!ended) add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_LOCAL_CLOSE, traceFlow, role, intent = intent) }
         terminal(false, local = true)
     }
     override fun toString() = "ProtectedRequestSignaling[redacted]"
@@ -198,6 +225,7 @@ internal class ProtectedRequestSignaling private constructor(
         fun open(bootstrap: ProtectedSignalingBootstrap, factory: ProtectedSocketFactory,
             events: ProtectedSignalingEvents, dispatch: (() -> Unit) -> Unit = { it() }): ProtectedRequestSignaling {
             val transport = ProtectedRequestSignaling(bootstrap, events, dispatch)
+            RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_OPEN, bootstrap.flow, bootstrap.role, intent = bootstrap.intent)
             try {
                 val socket = factory.open(bootstrap.url, transport) // Never under the controller lock.
                 transport.change {

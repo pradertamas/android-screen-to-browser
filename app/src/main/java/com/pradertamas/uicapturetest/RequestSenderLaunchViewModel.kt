@@ -33,6 +33,7 @@ internal class RequestSenderLaunch(private val controller: ConnectionRequestCont
         if (handled || !mediaEligible(controller.mediaSnapshot(), expected, MediaRole.SEND, resumed, role, gate)) return false
         handoff = handoffs.reserve(expected, MediaRole.SEND) ?: return false
         handled = true; consentPromptInFlight = true
+        RequestFlowTrace.record(RequestFlowTrace.Event.CONSENT_REQUESTED, expected, role, controller.state.value)
         try { prompt() } catch (_: Exception) { cancel() }
         return true
     }
@@ -40,6 +41,8 @@ internal class RequestSenderLaunch(private val controller: ConnectionRequestCont
         if (!consentPromptInFlight) return RequestLaunchResult.IGNORED
         consentPromptInFlight = false
         val current = controller.mediaSnapshot()
+        RequestFlowTrace.record(if (allowed) RequestFlowTrace.Event.CONSENT_GRANTED else RequestFlowTrace.Event.CONSENT_CANCELLED,
+            flow, role, controller.state.value.takeIf { current?.flow === flow })
         if (current == null || current.flow !== flow) { abandon(); return RequestLaunchResult.IGNORED }
         if (!allowed || role != MediaRole.SEND || !gate || current.exitRequested || current.state != ConnectionRequestState.CONNECTING) {
             cancel(); return RequestLaunchResult.CLOSED
@@ -47,6 +50,7 @@ internal class RequestSenderLaunch(private val controller: ConnectionRequestCont
         val id = handoff ?: return RequestLaunchResult.IGNORED
         return try {
             start(id)
+            RequestFlowTrace.record(RequestFlowTrace.Event.SERVICE_DISPATCHED, flow, role, controller.state.value)
             serviceHandoffTransferred = true; handoff = null
             RequestLaunchResult.TRANSFERRED
         } catch (_: Exception) { cancel(); RequestLaunchResult.CLOSED }
@@ -103,7 +107,10 @@ internal fun RequestSenderConsent(activity: ComponentActivity, model: RequestSen
             WebRtcState.set(WebRtcUi(busy = true, status = "Allow screen sharing"))
             try { launcher.launch(activity.getSystemService(MediaProjectionManager::class.java)
                 .createScreenCaptureIntent(MediaProjectionConfig.createConfigForUserChoice())) }
-            catch (_: Exception) { WebRtcState.set(WebRtcUi(status = "Screen sharing could not start")); throw IllegalStateException() }
+            catch (_: Exception) {
+                RequestFlowTrace.record(RequestFlowTrace.Event.CONSENT_LAUNCH_FAILED, exact, role.role, c.state.value)
+                WebRtcState.set(WebRtcUi(status = "Screen sharing could not start")); throw IllegalStateException()
+            }
         }
     }
 }
