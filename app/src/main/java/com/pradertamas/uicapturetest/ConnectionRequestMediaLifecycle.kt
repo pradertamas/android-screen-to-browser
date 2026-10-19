@@ -3,7 +3,13 @@ package com.pradertamas.uicapturetest
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-internal data class RequestCleanupUi(val retry: Boolean = false)
+/** Local selector for one rendered error episode; never a server credential. */
+internal class RequestCleanupRetryTarget internal constructor(internal val flow: Any) {
+    override fun toString() = "RequestCleanupRetryTarget[redacted]"
+}
+internal data class RequestCleanupUi(val retryTarget: RequestCleanupRetryTarget? = null) {
+    val retry: Boolean get() = retryTarget != null
+}
 /** Owner-serialized, event driven. No media operations or automatic network retry. */
 internal class ConnectionRequestMediaLifecycle(private val controller: ConnectionRequestController,
     private val release: () -> Unit) {
@@ -15,10 +21,20 @@ internal class ConnectionRequestMediaLifecycle(private val controller: Connectio
     private val mutable = MutableStateFlow(RequestCleanupUi())
     val state = mutable.asStateFlow()
     fun requestExit(flow: Any) { if (controller.markMediaExitRequested(flow)) changed() }
-    fun retry(flow: Any) {
-        if (target !== flow || stage != Stage.ERROR) return
-        stage = Stage.NEW; mutable.value = RequestCleanupUi()
-        changed()
+    fun retry(rendered: RequestCleanupRetryTarget) {
+        if (mutable.value.retryTarget !== rendered || target !== rendered.flow || stage != Stage.ERROR) return
+        val s = controller.mediaSnapshot() ?: return
+        if (s.flow !== rendered.flow || !s.exitRequested || s.operation != null || s.phase == RequestMediaPhase.STARTED ||
+            s.state?.terminal == true || s.state == ConnectionRequestState.CONNECTED) return
+        mutable.value = RequestCleanupUi()
+        // Admit the captured flow directly through the controller's exact-flow lock.
+        // Do not re-enter generic changed(): a worker may replace the context here.
+        if (retryReconcile) reconcile(s)
+        else {
+            baseline = s.exitCompletion?.revision ?: 0
+            stage = Stage.EXIT
+            if (!controller.requestMediaExit(rendered.flow)) fail(false)
+        }
     }
     fun changed() {
         val s = controller.mediaSnapshot()
@@ -30,6 +46,7 @@ internal class ConnectionRequestMediaLifecycle(private val controller: Connectio
         if (!s.exitRequested && s.phase != RequestMediaPhase.DISPOSED && s.state?.terminal != true) return
         if (s.operation != null) return
         if (s.state?.terminal == true || s.state == ConnectionRequestState.CONNECTED) {
+            mutable.value = RequestCleanupUi()
             controller.finishMediaFlow(s.flow, release); return
         }
         when (stage) {
@@ -61,7 +78,8 @@ internal class ConnectionRequestMediaLifecycle(private val controller: Connectio
         if (!controller.reconcileMediaExit(s.flow)) fail(true)
     }
     private fun fail(reconcile: Boolean) {
-        retryReconcile = reconcile; stage = Stage.ERROR; mutable.value = RequestCleanupUi(true)
+        retryReconcile = reconcile; stage = Stage.ERROR
+        mutable.value = RequestCleanupUi(RequestCleanupRetryTarget(checkNotNull(target)))
     }
 }
 

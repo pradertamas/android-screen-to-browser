@@ -38,6 +38,7 @@ class ReceiverActivity : ComponentActivity() {
         RequestMediaLifecycle.coordinator
         if (!::model.isInitialized || AppMediaRoles.role != MediaRole.RECEIVE || !model.startRequest(id))
             ConnectionRequestMediaHandoff.process.reject(id, RequestMediaLifecycle.coordinator::requestExit)
+        else model.attachedToTask(taskId) // startRequest may have rebound a previously detached owner.
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -115,6 +116,7 @@ class ReceiverActivity : ComponentActivity() {
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
             finish(); return
         }
+        model.attachedToTask(taskId)
         deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }

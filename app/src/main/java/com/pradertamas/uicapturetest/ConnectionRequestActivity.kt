@@ -61,11 +61,9 @@ class ConnectionRequestActivity : ComponentActivity() {
                 if (flow != null && !model.mediaTransferred && !model.exiting) {
                     val started = startRequestReceiver(ConnectionRequests.controller, ConnectionRequestMediaHandoff.process,
                         flow, life == androidx.lifecycle.Lifecycle.State.RESUMED, media.role,
-                        !ConnectionRequestRuntimeGate.legacyStartAllowed(), RequestMediaLifecycle.coordinator::requestExit) { id ->
-                        startActivity(Intent(this@ConnectionRequestActivity, ReceiverActivity::class.java)
-                            .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                            .putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value))
-                        true
+                        !ConnectionRequestRuntimeGate.legacyStartAllowed(), RequestMediaLifecycle.coordinator::requestExit,
+                        model.receiverTransfer) { id ->
+                        navigateRequestReceiver(this@ConnectionRequestActivity, id)
                     }
                     if (started) { model.mediaTransferred = true; finish() }
                 }
@@ -113,7 +111,7 @@ class ConnectionRequestActivity : ComponentActivity() {
     }
     private fun closeOwned() {
         val flow = model.flow
-        if (model.mediaTransferred) { finish(); return }
+        if (model.mediaTransferred || !model.receiverTransfer.cancel()) { finish(); return }
         if (flow == null || !coordinator.hasContext(flow)) { finish(); return }
         val s = ConnectionRequests.controller.mediaSnapshot()
         if (s?.flow === flow && s.won && s.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING)) {

@@ -110,20 +110,50 @@ internal fun RequestSenderConsent(activity: ComponentActivity, model: RequestSen
 
 internal fun startRequestReceiver(controller: ConnectionRequestController, handoffs: ConnectionRequestMediaHandoff,
     flow: Any, resumed: Boolean, role: MediaRole, gate: Boolean, exit: (Any) -> Unit,
+    transfer: RequestReceiverTransfer? = null,
     start: (RequestMediaHandoffId) -> Boolean): Boolean {
     if (!mediaEligible(controller.mediaSnapshot(), flow, MediaRole.RECEIVE, resumed, role, gate)) return false
     val id = handoffs.reserve(flow, MediaRole.RECEIVE) ?: return false
-    val success = try { start(id) } catch (_: Exception) { false }
+    transfer?.reserved(id)
+    val success = try { if (transfer == null) start(id) else transfer.start(start) } catch (_: Exception) { false }
     if (!success) handoffs.reject(id.value, exit)
     return success
+}
+
+/** Source lifecycle is main-thread serialized. Back before dispatch revokes the reservation;
+ * after successful dispatch, the source has no exit authority over the receiver transfer. */
+internal class RequestReceiverTransfer(private val abandon: (String) -> Unit) {
+    private var pending: RequestMediaHandoffId? = null
+    private var canceled = false
+    var transferred = false; private set
+    fun reserved(id: RequestMediaHandoffId) {
+        check(pending == null && !transferred)
+        if (canceled) abandon(id.value) else pending = id
+    }
+    fun start(navigate: (RequestMediaHandoffId) -> Boolean): Boolean {
+        val id = pending ?: return false
+        if (canceled) return false
+        val success = try { navigate(id) } finally { pending = null }
+        if (success) transferred = true
+        return success
+    }
+    /** True means source Back won; caller performs its exact-flow exit. */
+    fun cancel(): Boolean {
+        if (transferred) return false
+        canceled = true
+        pending?.let { abandon(it.value) }; pending = null
+        return true
+    }
+    override fun toString() = "RequestReceiverTransfer[redacted]"
 }
 
 @Composable
 internal fun RequestCleanupRetry(expected: Any? = null, scoped: Boolean = false) {
     val lifecycle = RequestMediaLifecycle.coordinator
     val ui by lifecycle.state.collectAsState()
-    if (ui.retry && (!scoped || (expected != null && ConnectionRequests.controller.mediaSnapshot()?.flow === expected))) {
+    val retryTarget = ui.retryTarget
+    if (retryTarget != null && (!scoped || (expected != null && retryTarget.flow === expected))) {
         Text("Could not close the connection.")
-        Button(onClick = { (if (scoped) expected else ConnectionRequests.controller.mediaSnapshot()?.flow)?.let(lifecycle::retry) }) { Text("Try again") }
+        Button(onClick = { lifecycle.retry(retryTarget) }) { Text("Try again") }
     }
 }

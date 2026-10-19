@@ -334,8 +334,11 @@ class ConnectionRequestRecipientTest {
         assertFalse(activity.contains("putBoolean")); assertFalse(activity.contains("onSaveInstanceState")); assertFalse(activity.contains("recipientOwner"))
         for (text in listOf(activity, model)) for (forbidden in listOf("SavedStateHandle", "rememberSaveable", "SharedPreferences", "DataStore")) assertFalse(text.contains(forbidden))
         // B4E permits only an opaque one-shot media handoff in navigation, never the flow/bearer.
-        assertEquals(1, Regex("\\.putExtra\\(").findAll(activity).count())
-        assertTrue(activity.contains("putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value)"))
+        assertEquals(0, Regex("\\.putExtra\\(").findAll(activity).count())
+        assertTrue(activity.contains("navigateRequestReceiver(this@ConnectionRequestActivity, id)"))
+        val navigation = java.io.File("src/main/java/com/pradertamas/uicapturetest/RequestReceiverNavigation.kt").readText()
+        assertEquals(1, Regex("\\.putExtra\\(").findAll(navigation).count())
+        assertTrue(navigation.contains("putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value)"))
         assertTrue(activity.contains("coordinator.observe(flow)")); assertTrue(activity.contains("coordinator.close(flow)"))
     }
     private fun source(name: String) = listOf(File("src/main/java/com/pradertamas/uicapturetest/$name.kt"), File("app/src/main/java/com/pradertamas/uicapturetest/$name.kt")).first { it.isFile }.readText()

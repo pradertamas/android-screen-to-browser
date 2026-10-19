@@ -51,7 +51,9 @@ unchanged.
 
 ## Receiver handoff and retention
 
-Navigation uses REORDER_TO_FRONT/SINGLE_TOP and only REQUEST_MEDIA_HANDOFF.
+Navigation carries only REQUEST_MEDIA_HANDOFF. Warm navigation selects the exact
+bound receiver task via AppTask.startActivity with CLEAR_TOP | SINGLE_TOP (without
+NEW_TASK or REORDER_TO_FRONT). Cold navigation uses NEW_TASK | CLEAR_TOP | SINGLE_TOP.
 ReceiverActivity scrubs this extra from incoming/current Intents before handing it
 to the existing ViewModel, both in onCreate and onNewIntent. Duplicate, unknown,
 stale or refused handoffs fail closed and cannot open a second socket. Refused
@@ -96,6 +98,54 @@ automatic initiator monitoring for an exiting flow. No automatic exit retry loop
 is introduced. MainActivity and ReceiverActivity show "Could not close the
 connection" / "Try again"; recipient UI also has a flow-scoped retry. Retry admits
 one exact exit or reconciliation operation.
+
+## FIX1: rendered retry authority and receiver task reuse
+
+Baseline: `b14112a0db2300cca7ee242e3e213075fb1b6337`.
+
+Every cleanup-error episode publishes a credential-free, redacted
+RequestCleanupRetryTarget containing only exact local flow identity. All three
+Activities use the same composable: its button captures the target at render time.
+There is no click-time current-flow lookup. Retry checks the target instance, error
+episode, current exact flow, exit intent and operation state; network admission is
+still through the existing exact-flow controller lock. Old A callbacks cannot retry
+B, even when B also has a cleanup error. Admission consumes the rendered target;
+another error creates a new target. Terminal/CONNECTED reconciliation invalidates it.
+
+The bound receiver owner records only its integer Android task ID, associated with
+the existing ViewModel identity. Rebinding that same owner preserves the task;
+unbind/role departure removes it. No Activity reference or cross-Activity ViewModel
+reference is stored, and the single-owner bind guard is unchanged.
+
+For both same-task and cross-task warm entry, navigation finds that exact AppTask
+and uses CLEAR_TOP | SINGLE_TOP. AppTask.startActivity brings that task forward;
+CLEAR_TOP selects the existing ReceiverActivity and SINGLE_TOP preserves its
+standard-mode instance, delivering onNewIntent to the retained ViewModel. NEW_TASK
+is deliberately absent from this AppTask Intent. If a bound task cannot be found,
+the path fails closed rather than creating a competing owner. Cold entry, when no
+owner is bound, uses NEW_TASK | CLEAR_TOP | SINGLE_TOP and creates/binds normally.
+The manifest and legacy MainActivity.openReceiver navigation are unchanged.
+
+Android references:
+- https://developer.android.com/reference/android/app/ActivityManager.AppTask#startActivity(android.content.Context,%20android.content.Intent,%20android.os.Bundle)
+- https://developer.android.com/reference/android/content/Intent#FLAG_ACTIVITY_CLEAR_TOP
+
+Receiver onNewIntent immediately scrubs the opaque handoff before one-shot start.
+No bearer, session code or bootstrap crosses the Intent. Successful dispatch marks
+the retained source transfer complete before finish, without withdraw/clear/release.
+Back before dispatch revokes the pending reservation and requests exact-flow exit;
+Back after transfer cannot withdraw the receiver's flow. Navigation refusal or
+exception abandons/rejects the reservation and requests exact-flow exit. A terminal
+state while the consent prompt is open rejects a late Allow result; a terminal
+state during receiver navigation fails fresh redemption before socket/media start.
+Stale results/redemptions cannot adopt a replacement flow or release its gate.
+
+Unit coverage uses the real controller/mailbox and controlled workers for captured
+retry callbacks, duplicate/current retry, target invalidation, transfer/Back ordering,
+terminal consent/navigation and duplicate handoff consumption. Exact warm/cold flag
+values and bound/unbound decisions are tested as pure navigation policy. Wiring is
+also source-audited. These are not instrumented Android task/Intent delivery tests.
+PHYSICAL same-task/cross-task warm reuse and Activity recreation: PENDING.
 
 HTTP CONNECTED still means signaling participants authenticated, not media-connected.
 Sharing/Receiving remains driven by WebRtcService/ReceiverEngine/first frame.

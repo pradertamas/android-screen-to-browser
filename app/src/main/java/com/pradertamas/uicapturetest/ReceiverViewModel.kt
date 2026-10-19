@@ -15,6 +15,7 @@ data class ReceiverUi(val home: ReceiverHome = ReceiverHome(), val resolution: S
 
 /** Retains only native session/application, never an Activity across recreation. View detaches in onDestroy. */
 class ReceiverViewModel(application: Application) : AndroidViewModel(application) {
+    internal fun attachedToTask(taskId: Int) = AppMediaRoles.receiverAttachedToTask(this, taskId)
     private val main = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
     private val mutable = MutableStateFlow(ReceiverUi())

@@ -538,7 +538,7 @@ class RequestMediaTest {
             assertEquals(1, f.cancels); assertTrue(life.state.value.retry); assertEquals(0, releases)
             assertSame(flow, f.controller.mediaSnapshot()!!.flow); assertTrue(f.controller.mediaSnapshot()!!.exitRequested)
             assertNull(f.handoffs.reserve(flow, MediaRole.SEND))
-            f.exitError = null; life.retry(flow); f.worker.run(); life.changed()
+            f.exitError = null; life.retry(checkNotNull(life.state.value.retryTarget)); f.worker.run(); life.changed()
             assertEquals(2, f.cancels); assertEquals(1, releases)
         }
     }
@@ -615,8 +615,9 @@ class RequestMediaTest {
         val f = Fixture(); val a = f.initiator(); f.exitError = ConnectionRequestError.NETWORK
         val life = ConnectionRequestMediaLifecycle(f.controller) { error("stale release") }
         life.requestExit(a); f.worker.run(); life.changed(); assertTrue(life.state.value.retry)
+        val rendered = checkNotNull(life.state.value.retryTarget)
         val b = f.initiator(); val state = f.controller.state.value
-        life.changed(); life.retry(a); life.requestExit(a)
+        life.changed(); life.retry(rendered); life.requestExit(a)
         assertEquals(state, f.controller.state.value); assertSame(b, f.controller.mediaSnapshot()!!.flow)
     }
     @Test fun processAbandonNotificationClosesEarlyServiceFailureWithoutChangingCoreAbandonPolicy() {
@@ -650,7 +651,7 @@ class RequestMediaTest {
         life.requestExit(flow); f.worker.run(); life.changed(); f.worker.run(); life.changed()
         assertTrue(life.state.value.retry)
         repeat(8) { life.changed() }; assertTrue(f.worker.tasks.isEmpty()); assertEquals(1, f.cancels)
-        life.retry(flow); assertEquals(1, f.worker.tasks.size)
+        life.retry(checkNotNull(life.state.value.retryTarget)); assertEquals(1, f.worker.tasks.size)
         f.worker.run(); life.changed(); assertTrue(life.state.value.retry)
     }
     @Test fun receiverNeverStartsInitialMediaFromConnected() {
@@ -666,6 +667,131 @@ class RequestMediaTest {
         life.requestExit(flow)
         assertFalse(f.controller.initiatorMonitorSnapshot()!!.active)
         assertFalse(f.controller.refreshInitiatorStatus(MediaRole.SEND, flow))
+    }
+    @Test fun renderedOldRetryCallbackCannotRetryReplacementCleanupError() {
+        for (recipient in listOf(false, true)) {
+            val f = Fixture(); val a: Any = if (recipient) f.recipient() else f.initiator()
+            var releases = 0
+            val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+            f.exitError = ConnectionRequestError.NETWORK
+            life.requestExit(a); f.worker.run(); life.changed()
+            // Same capture as the composable's onClick, before B exists.
+            val renderedA = checkNotNull(life.state.value.retryTarget)
+            val oldOnClick = { life.retry(renderedA) }
+            f.controller.clear()
+            val b: Any = if (recipient) f.recipient() else f.initiator()
+            life.requestExit(b); f.worker.run(); life.changed()
+            val bUi = life.state.value; val bState = f.controller.state.value
+            val calls = f.cancels + f.withdraws
+            oldOnClick(); f.worker.run()
+            assertEquals(calls, f.cancels + f.withdraws); assertEquals(0, releases)
+            assertSame(b, f.controller.mediaSnapshot()!!.flow)
+            assertEquals(bState, f.controller.state.value); assertSame(bUi, life.state.value)
+        }
+    }
+    @Test fun renderedCurrentRetryIsSingleFlightAndInvalidatedOnSuccess() {
+        for (recipient in listOf(false, true)) {
+            val f = Fixture(); val flow: Any = if (recipient) f.recipient() else f.initiator()
+            var releases = 0; val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+            f.exitError = ConnectionRequestError.NETWORK
+            life.requestExit(flow); f.worker.run(); life.changed()
+            val rendered = checkNotNull(life.state.value.retryTarget)
+            val onClick = { life.retry(rendered) }
+            f.exitError = null; onClick(); onClick()
+            assertEquals(1, f.worker.tasks.size)
+            f.worker.run(); life.changed(); onClick()
+            assertEquals(2, f.cancels + f.withdraws); assertEquals(1, releases)
+            assertNull(life.state.value.retryTarget); assertNull(f.controller.mediaSnapshot())
+        }
+    }
+    @Test fun retryErrorEpisodeInvalidatesPreviousRenderedTargetEvenForSameFlow() {
+        val f = Fixture(); val flow = f.initiator(); f.exitError = ConnectionRequestError.NETWORK
+        val life = ConnectionRequestMediaLifecycle(f.controller) { error("release") }
+        life.requestExit(flow); f.worker.run(); life.changed()
+        val old = checkNotNull(life.state.value.retryTarget)
+        life.retry(old); f.worker.run(); life.changed()
+        val current = checkNotNull(life.state.value.retryTarget)
+        assertNotSame(old, current)
+        life.retry(old); assertTrue(f.worker.tasks.isEmpty())
+        life.retry(current); assertEquals(1, f.worker.tasks.size)
+        assertEquals("RequestCleanupRetryTarget[redacted]", current.toString())
+    }
+    @Test fun receiverNavigationWarmRouteUsesExactBoundTaskAndReuseFlags() {
+        // Same result whether caller is in task 12 (same-task) or 99 (cross-task).
+        val warm = requestReceiverRoute(RequestReceiverTask(true, 12))!!
+        assertEquals(12, warm.taskId)
+        assertEquals(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP, warm.flags)
+        assertEquals(0, warm.flags and android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        assertEquals(0, warm.flags and android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        assertNull(requestReceiverRoute(RequestReceiverTask(true, null)))
+    }
+    @Test fun receiverNavigationColdRouteHasSeparateExplicitTaskPolicy() {
+        val cold = requestReceiverRoute(RequestReceiverTask(false, null))!!
+        assertNull(cold.taskId)
+        assertEquals(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+            android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP, cold.flags)
+        // Stale routing metadata cannot turn an unbound owner into a warm owner.
+        assertNull(requestReceiverRoute(RequestReceiverTask(false, 12))!!.taskId)
+    }
+    @Test fun backWinsBeforeReceiverTransferAbandonsAndWithdraws() {
+        val f = Fixture(); val flow = f.recipient(); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }
+        val transfer = RequestReceiverTransfer(f.handoffs::abandon)
+        val id = f.handoffs.reserve(flow, MediaRole.RECEIVE)!!
+        transfer.reserved(id)
+        if (transfer.cancel()) life.requestExit(flow)
+        assertFalse(transfer.start { error("navigation after Back") })
+        assertNull(f.handoffs.consume(id, MediaRole.RECEIVE))
+        f.worker.run(); life.changed()
+        assertEquals(1, f.withdraws); assertEquals(1, releases)
+    }
+    @Test fun transferWinsBeforeBackSourceCannotWithdrawAndDuplicateHandoffIsInert() {
+        val f = Fixture(); val flow = f.recipient()
+        val transfer = RequestReceiverTransfer(f.handoffs::abandon)
+        var delivered: RequestMediaHandoffId? = null
+        assertTrue(startRequestReceiver(f.controller, f.handoffs, flow, true, MediaRole.RECEIVE, true,
+            { error("exit") }, transfer) { delivered = it; true })
+        assertTrue(transfer.transferred); assertFalse(transfer.cancel())
+        assertNotNull(f.handoffs.consume(checkNotNull(delivered), MediaRole.RECEIVE))
+        assertNull(f.handoffs.consume(checkNotNull(delivered), MediaRole.RECEIVE))
+        assertEquals(0, f.withdraws); assertFalse(f.controller.mediaSnapshot()!!.exitRequested)
+    }
+    @Test fun terminalWhileConsentPromptIsOpenRejectsLateAllowWithoutServiceOrReservation() {
+        for (terminal in listOf(ConnectionRequestState.CANCELED, ConnectionRequestState.EXPIRED, ConnectionRequestState.FAILED)) {
+            val f = Fixture(); val flow = f.initiator()
+            val launch = RequestSenderLaunch(f.controller, f.handoffs) { f.controller.markMediaExitRequested(it) }
+            assertTrue(launch.begin(flow, true, MediaRole.SEND, true) {})
+            f.server = terminal; f.assignment = null; f.controller.refreshStatus(); f.worker.run()
+            assertEquals(RequestLaunchResult.CLOSED, launch.result(true, MediaRole.SEND, true) { error("service") })
+            assertNull(f.controller.mediaSnapshot()!!.phase)
+            assertNull(f.handoffs.reserve(flow, MediaRole.SEND))
+        }
+    }
+    @Test fun terminalDuringNavigationRejectsFreshRedemptionAndCannotTouchReplacement() {
+        val r = ReceiverFixture(true); val id = r.f.handoffs.reserve(r.flow, MediaRole.RECEIVE)!!
+        r.f.server = ConnectionRequestState.EXPIRED; r.f.assignment = null
+        r.f.controller.refreshStatus(); r.f.worker.run()
+        assertFalse(r.owner.start(id)); assertEquals(0, r.factory.opens); assertEquals(0, r.media)
+        r.f.controller.clear(); val b = r.f.initiator(MediaRole.RECEIVE)
+        val state = r.f.controller.state.value
+        assertFalse(r.owner.start(id)); assertEquals(state, r.f.controller.state.value)
+        assertSame(b, r.f.controller.mediaSnapshot()!!.flow)
+    }
+    @Test fun retryAndExactTaskNavigationProductionWiringAudit() {
+        val base = java.io.File("src/main/java/com/pradertamas/uicapturetest")
+        val sender = java.io.File(base, "RequestSenderLaunchViewModel.kt").readText().substringAfter("internal fun RequestCleanupRetry")
+        assertTrue(sender.contains("val retryTarget = ui.retryTarget"))
+        assertTrue(sender.contains("lifecycle.retry(retryTarget)")); assertFalse(sender.contains("mediaSnapshot()"))
+        for (name in listOf("MainActivity.kt", "ReceiverActivity.kt"))
+            assertTrue(java.io.File(base, name).readText().contains("RequestCleanupRetry()"))
+        val navigation = java.io.File(base, "RequestReceiverNavigation.kt").readText()
+        assertTrue(navigation.contains("it.taskInfo?.taskId == route.taskId"))
+        assertTrue(navigation.contains("task.startActivity(activity, intent, null)"))
+        assertFalse(navigation.contains("REORDER_TO_FRONT"))
+        val receiver = java.io.File(base, "ReceiverActivity.kt").readText()
+        assertTrue(receiver.indexOf("model.attachedToTask(taskId)") < receiver.indexOf("deliverRequestHandoff(requestHandoff)"))
+        val manifest = java.io.File("src/main/AndroidManifest.xml").readText()
+        assertTrue(manifest.contains("<activity android:name=\".ReceiverActivity\" android:exported=\"false\" />"))
     }
     @Test fun androidWiringUsesSeparateConsentAndScrubbedReceiverHandoffs() {
         val base = java.io.File("src/main/java/com/pradertamas/uicapturetest")

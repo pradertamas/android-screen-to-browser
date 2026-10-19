@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 
 /** Activity-scoped, configuration-retained local identity only. No SavedState or credentials. */
 class ConnectionRequestActivityViewModel : ViewModel() {
+    internal val receiverTransfer = RequestReceiverTransfer(ConnectionRequestMediaHandoff.process::abandon)
     internal var mediaTransferred by mutableStateOf(false)
     internal var exiting by mutableStateOf(false)
     internal var flow: ConnectionRequestRecipientFlow? by mutableStateOf(null)

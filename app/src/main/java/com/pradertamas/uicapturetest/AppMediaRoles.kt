@@ -20,7 +20,8 @@ object AppMediaRoles {
     val receiverRevision = receiverRevisionMutable.asStateFlow()
     fun receiverPhaseChanged() { receiverRevisionMutable.value++ }
     val role: MediaRole get() = state.value.role
-    private data class ReceiverOwner(val identity: Any, val stop: () -> Unit, val canLeave: () -> Boolean)
+    private data class ReceiverOwner(val identity: Any, val stop: () -> Unit, val canLeave: () -> Boolean,
+        val taskId: Int? = null)
     private var receiver: ReceiverOwner? = null
     private val controller = MediaRoleController({ old ->
         when (old) {
@@ -62,7 +63,13 @@ object AppMediaRoles {
     fun bindReceiver(identity: Any, stop: () -> Unit, canLeave: () -> Boolean) {
         check(role == MediaRole.RECEIVE)
         check(receiver == null || receiver?.identity === identity)
-        receiver = ReceiverOwner(identity, stop, canLeave)
+        receiver = ReceiverOwner(identity, stop, canLeave, receiver?.taskId)
+    }
+    /** Main-thread task routing metadata only; the ViewModel itself never leaves this owner. */
+    internal fun receiverTask(): RequestReceiverTask = RequestReceiverTask(receiver != null, receiver?.taskId)
+    internal fun receiverAttachedToTask(identity: Any, taskId: Int) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        receiver?.takeIf { it.identity === identity }?.let { receiver = it.copy(taskId = taskId) }
     }
     fun unbindReceiver(identity: Any) { if (receiver?.identity === identity) receiver = null }
 }
