@@ -147,6 +147,41 @@ values and bound/unbound decisions are tested as pure navigation policy. Wiring 
 also source-audited. These are not instrumented Android task/Intent delivery tests.
 PHYSICAL same-task/cross-task warm reuse and Activity recreation: PENDING.
 
+## FIX2: lifecycle association survives failed handoff
+
+Baseline: `fc2db9843741ad40f70befe749968204df7c0417`.
+
+ReceiverViewModel.ensureBoundToTask(current Activity.taskId) checks RECEIVE role
+and performs an exact-identity bind-to-task through AppMediaRoles on the main
+thread. Owner callbacks and task ID are installed together in one registry record.
+Another owner cannot be replaced; invalid task IDs leave the old record unchanged.
+This bookkeeping neither invokes stop/canLeave nor starts media, signaling or HTTP.
+
+onCreate attaches after obtaining the ViewModel and before handoff delivery.
+onNewIntent reads/scrubs the opaque extra, then attaches before startRequest.
+onResume repeats the same idempotent association as a lifecycle repair. Association
+is not a request-success property: terminal, stale or invalid handoffs leave the
+bound receiver's task ID intact. startRequest itself no longer performs a separate
+taskless rebind. Repeated attachment/configuration recreation preserves the owner;
+role departure removes owner and task together, and later attachment restores both.
+Only current Activity lifecycle callbacks supply task IDs; no worker/cached-source
+task updates exist. A retained ViewModel ordinarily stays in the same task during
+configuration recreation; a legitimate current attachment can update its scalar ID.
+
+The FIX1 warm/cold flag policy is unchanged. A shared injectable dispatch helper
+selects the exact middle/matching AppTask, never a first-task fallback. Missing warm
+tasks, enumeration exceptions and start exceptions return failure without trying a
+cold route. The existing caller then rejects the reservation and requests exact-flow
+exit. Source transfer/finish and retry-target architecture are unchanged.
+
+Deterministic tests cover the production registry with the real request receiver
+owner/mailbox: unbind -> reattach -> terminal/invalid handoffs -> task preserved ->
+next valid handoff starts via the same warm task. Additional coverage checks stale
+owner/unbind guards, repeated attachment, exact enumeration, missing tasks, API
+exceptions with reservation/exit cleanup, and cold routing. Android ViewModel/task
+lifecycle wiring receives source audit and compilation, not an instrumented test.
+PHYSICAL task routing, Activity recreation and App Link verification remain PENDING.
+
 HTTP CONNECTED still means signaling participants authenticated, not media-connected.
 Sharing/Receiving remains driven by WebRtcService/ReceiverEngine/first frame.
 The sender's existing Stop sends WebRtcService.STOP. Legacy service disposal never

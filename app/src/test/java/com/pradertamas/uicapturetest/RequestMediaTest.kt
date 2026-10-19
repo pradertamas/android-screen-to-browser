@@ -777,6 +777,102 @@ class RequestMediaTest {
         assertFalse(r.owner.start(id)); assertEquals(state, r.f.controller.state.value)
         assertSame(b, r.f.controller.mediaSnapshot()!!.flow)
     }
+    @Test fun retainedOwnerFailedRebindHandoffKeepsTaskAndNextValidRequestUsesIt() {
+        val r = ReceiverFixture(true)
+        val registry = ReceiverOwnerRegistry(); val retained = Any(); var bookkeepingEffects = 0
+        registry.bind(MediaRole.RECEIVE, retained, { bookkeepingEffects++ }, { true }, 21)
+        registry.unbind(retained) // RECEIVE -> SEND departure, same retained VM.
+        assertFalse(registry.task().bound)
+        repeat(3) {
+            // Production bindReceiverToTask uses exactly this atomic registry admission.
+            registry.bind(MediaRole.RECEIVE, retained, { bookkeepingEffects++ }, { true }, 21)
+            if (it == 0) {
+                val id = r.f.handoffs.reserve(r.flow, MediaRole.RECEIVE)!!
+                r.f.server = ConnectionRequestState.EXPIRED; r.f.assignment = null
+                r.f.controller.refreshStatus(); r.f.worker.run()
+                assertFalse(r.owner.start(id))
+            } else assertFalse(r.owner.start("missing-handoff"))
+            assertTrue(registry.attached(retained)); assertEquals(21, registry.task().taskId)
+            assertEquals(0, r.factory.opens)
+        }
+        r.f.controller.clear()
+        val valid = r.f.recipient(); val id = r.f.handoffs.reserve(valid, MediaRole.RECEIVE)!!
+        var starts = 0
+        assertTrue(dispatchRequestReceiver(requestReceiverRoute(registry.task())!!, { listOf(11, 21, 31) }, { it },
+            { task, _ -> assertEquals(21, task); starts++; assertTrue(r.owner.start(id)) },
+            { error("cold fallback") }))
+        assertEquals(1, starts); assertEquals(1, r.factory.opens); assertEquals(0, bookkeepingEffects)
+    }
+    @Test fun receiverTaskAttachmentIsIdempotentAndRejectsStaleIdentity() {
+        val registry = ReceiverOwnerRegistry(); val a = Any(); val b = Any()
+        registry.bind(MediaRole.RECEIVE, a, { error("stop") }, { true }, 10)
+        repeat(3) { registry.bind(MediaRole.RECEIVE, a, { error("stop") }, { true }, 10) }
+        assertSame(a, registry.current!!.identity); assertEquals(10, registry.task().taskId)
+        registry.clear() // role departure
+        registry.bind(MediaRole.RECEIVE, b, {}, { true }, 20)
+        assertTrue(runCatching { registry.bind(MediaRole.RECEIVE, a, {}, { true }, 30) }.isFailure)
+        registry.unbind(a)
+        assertSame(b, registry.current!!.identity); assertEquals(20, registry.task().taskId)
+        assertTrue(runCatching { registry.bind(MediaRole.SEND, b, {}, { true }, 40) }.isFailure)
+        assertTrue(runCatching { registry.bind(MediaRole.RECEIVE, b, {}, { true }, -1) }.isFailure)
+        assertEquals(20, registry.task().taskId)
+        registry.unbind(b); assertFalse(registry.task().bound); assertNull(registry.task().taskId)
+    }
+    @Test fun receiverTaskEnumerationSelectsExactMiddleTask() {
+        var selected = 0; var flags = 0
+        val route = requestReceiverRoute(RequestReceiverTask(true, 2))!!
+        assertTrue(dispatchRequestReceiver(route, { listOf(1, 2, 3) }, { it },
+            { task, receivedFlags -> selected = task; flags = receivedFlags }, { error("cold") }))
+        assertEquals(2, selected); assertEquals(route.flags, flags)
+    }
+    @Test fun missingTaskRejectsReservationAndExitsWithoutColdFallback() {
+        val f = Fixture(); val flow = f.recipient()
+        val life = ConnectionRequestMediaLifecycle(f.controller) {}
+        assertFalse(startRequestReceiver(f.controller, f.handoffs, flow, true, MediaRole.RECEIVE, true, life::requestExit) { id ->
+            assertSame(flow, f.handoffs.flowFor(id.value))
+            dispatchRequestReceiver(requestReceiverRoute(RequestReceiverTask(true, 4))!!, { listOf(1, 2) }, { it },
+                { _, _ -> error("wrong task") }, { error("cold fallback") })
+        })
+        f.worker.run(); life.changed()
+        assertEquals(1, f.withdraws); assertNull(f.controller.mediaSnapshot())
+    }
+    @Test fun taskStartAndEnumerationExceptionsRejectExactReservationWithoutColdFallback() {
+        for (enumerationFails in listOf(false, true)) {
+            val f = Fixture(); val flow = f.recipient(); var selected = 0
+            val life = ConnectionRequestMediaLifecycle(f.controller) {}
+            var token: RequestMediaHandoffId? = null
+            assertFalse(startRequestReceiver(f.controller, f.handoffs, flow, true, MediaRole.RECEIVE, true, life::requestExit) { id ->
+                token = id
+                dispatchRequestReceiver(requestReceiverRoute(RequestReceiverTask(true, 2))!!,
+                    { if (enumerationFails) throw SecurityException() else listOf(1, 2, 3) }, { it },
+                    { task, _ -> selected = task; throw IllegalArgumentException() }, { error("cold fallback") })
+            })
+            assertNull(f.handoffs.flowFor(checkNotNull(token).value))
+            assertEquals(if (enumerationFails) 0 else 2, selected)
+            f.worker.run(); life.changed(); assertEquals(1, f.withdraws)
+        }
+    }
+    @Test fun coldNavigationDoesNotEnumerateWarmTasks() {
+        var starts = 0
+        val route = requestReceiverRoute(RequestReceiverTask(false, null))!!
+        assertTrue(dispatchRequestReceiver<Int>(route, { error("enumeration") }, { it },
+            { _, _ -> error("warm") }, { flags -> starts++; assertEquals(route.flags, flags) }))
+        assertEquals(1, starts)
+    }
+    @Test fun receiverLifecycleAssociatesBeforeAnyHandoffAndResumeHasNoMediaEffects() {
+        val base = java.io.File("src/main/java/com/pradertamas/uicapturetest")
+        val activity = java.io.File(base, "ReceiverActivity.kt").readText()
+        val delivery = activity.substringAfter("private fun deliverRequestHandoff").substringBefore("override fun onNewIntent")
+        assertTrue(delivery.indexOf("ensureBoundToTask(taskId)") < delivery.indexOf("model.startRequest(id)"))
+        val create = activity.substringAfter("override fun onCreate").substringBefore("setContent")
+        assertTrue(create.indexOf("ensureBoundToTask(taskId)") < create.indexOf("deliverRequestHandoff(requestHandoff)"))
+        assertTrue(activity.substringAfter("override fun onResume").substringBefore("override fun onPause").contains("ensureBoundToTask(taskId)"))
+        val vm = java.io.File(base, "ReceiverViewModel.kt").readText()
+        val attach = vm.substringAfter("internal fun ensureBoundToTask").substringBefore("private val main")
+        assertTrue(attach.contains("bindReceiverToTask(this, taskId"))
+        for (forbidden in listOf("engine.", "request.start", "reserve(", "consume(", "startActivity", "api."))
+            assertFalse(attach.contains(forbidden))
+    }
     @Test fun retryAndExactTaskNavigationProductionWiringAudit() {
         val base = java.io.File("src/main/java/com/pradertamas/uicapturetest")
         val sender = java.io.File(base, "RequestSenderLaunchViewModel.kt").readText().substringAfter("internal fun RequestCleanupRetry")
@@ -785,11 +881,11 @@ class RequestMediaTest {
         for (name in listOf("MainActivity.kt", "ReceiverActivity.kt"))
             assertTrue(java.io.File(base, name).readText().contains("RequestCleanupRetry()"))
         val navigation = java.io.File(base, "RequestReceiverNavigation.kt").readText()
-        assertTrue(navigation.contains("it.taskInfo?.taskId == route.taskId"))
+        assertTrue(navigation.contains("taskId(it) == route.taskId"))
         assertTrue(navigation.contains("task.startActivity(activity, intent, null)"))
         assertFalse(navigation.contains("REORDER_TO_FRONT"))
         val receiver = java.io.File(base, "ReceiverActivity.kt").readText()
-        assertTrue(receiver.indexOf("model.attachedToTask(taskId)") < receiver.indexOf("deliverRequestHandoff(requestHandoff)"))
+        assertTrue(receiver.indexOf("model.ensureBoundToTask(taskId)") < receiver.indexOf("model.startRequest(id)"))
         val manifest = java.io.File("src/main/AndroidManifest.xml").readText()
         assertTrue(manifest.contains("<activity android:name=\".ReceiverActivity\" android:exported=\"false\" />"))
     }

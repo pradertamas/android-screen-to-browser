@@ -34,11 +34,11 @@ class ReceiverActivity : ComponentActivity() {
         return id
     }
     private fun deliverRequestHandoff(id: String?) {
+        val attached = ::model.isInitialized && model.ensureBoundToTask(taskId)
         if (id == null) return
         RequestMediaLifecycle.coordinator
-        if (!::model.isInitialized || AppMediaRoles.role != MediaRole.RECEIVE || !model.startRequest(id))
+        if (!attached || !model.startRequest(id))
             ConnectionRequestMediaHandoff.process.reject(id, RequestMediaLifecycle.coordinator::requestExit)
-        else model.attachedToTask(taskId) // startRequest may have rebound a previously detached owner.
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -48,6 +48,7 @@ class ReceiverActivity : ComponentActivity() {
     private val requestSetupOwner = ConnectionRequestSetupOwner()
     override fun onResume() {
         super.onResume()
+        if (::model.isInitialized) model.ensureBoundToTask(taskId)
         ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.RECEIVE)
         ConnectionRequestSetup.coordinator.foreground(requestSetupOwner, MediaRole.RECEIVE)
     }
@@ -116,7 +117,10 @@ class ReceiverActivity : ComponentActivity() {
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
             finish(); return
         }
-        model.attachedToTask(taskId)
+        if (!model.ensureBoundToTask(taskId)) {
+            requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
+            finish(); return
+        }
         deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { returnToSend(stopActive = true) }

@@ -16,6 +16,20 @@ internal fun requestReceiverRoute(owner: RequestReceiverTask): RequestReceiverRo
             (if (owner.bound) 0 else Intent.FLAG_ACTIVITY_NEW_TASK))
 }
 
+/** Shared production/test boundary. A warm lookup miss or API exception never falls back cold. */
+internal fun <T> dispatchRequestReceiver(route: RequestReceiverRoute, tasks: () -> List<T>,
+    taskId: (T) -> Int?, warm: (T, Int) -> Unit, cold: (Int) -> Unit): Boolean {
+    return try {
+        if (route.taskId == null) cold(route.flags)
+        else {
+            val exact = tasks().firstOrNull { taskId(it) == route.taskId }
+            if (exact == null) return false
+            warm(exact, route.flags)
+        }
+        true
+    } catch (_: Exception) { false }
+}
+
 /** Warm routing selects the exact bound owner's task, rather than guessing by task affinity.
  * CLEAR_TOP + SINGLE_TOP delivers to its existing standard-mode Activity via onNewIntent.
  * Missing warm task fails closed; it never creates a competing receiver owner.
@@ -24,11 +38,8 @@ internal fun navigateRequestReceiver(activity: Activity, id: RequestMediaHandoff
     val route = requestReceiverRoute(AppMediaRoles.receiverTask()) ?: return false
     val intent = Intent(activity, ReceiverActivity::class.java).addFlags(route.flags)
         .putExtra(ReceiverActivity.REQUEST_MEDIA_HANDOFF, id.value)
-    if (route.taskId == null) activity.startActivity(intent)
-    else {
-        val task = activity.getSystemService(ActivityManager::class.java).appTasks
-            .firstOrNull { it.taskInfo?.taskId == route.taskId } ?: return false
-        task.startActivity(activity, intent, null)
-    }
-    return true
+    return dispatchRequestReceiver(route,
+        { activity.getSystemService(ActivityManager::class.java).appTasks },
+        { it.taskInfo?.taskId }, { task, _ -> task.startActivity(activity, intent, null) },
+        { activity.startActivity(intent) })
 }

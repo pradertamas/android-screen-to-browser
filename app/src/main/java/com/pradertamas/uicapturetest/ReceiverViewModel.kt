@@ -15,7 +15,13 @@ data class ReceiverUi(val home: ReceiverHome = ReceiverHome(), val resolution: S
 
 /** Retains only native session/application, never an Activity across recreation. View detaches in onDestroy. */
 class ReceiverViewModel(application: Application) : AndroidViewModel(application) {
-    internal fun attachedToTask(taskId: Int) = AppMediaRoles.receiverAttachedToTask(this, taskId)
+    /** Lifecycle bookkeeping only. No media/signaling operations; false preserves another owner. */
+    internal fun ensureBoundToTask(taskId: Int): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (AppMediaRoles.role != MediaRole.RECEIVE) return false
+        return runCatching { AppMediaRoles.bindReceiverToTask(this, taskId, ::stop,
+            { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) }) }.isSuccess
+    }
     private val main = Handler(Looper.getMainLooper())
     private val http = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
     private val mutable = MutableStateFlow(ReceiverUi())
@@ -52,8 +58,7 @@ class ReceiverViewModel(application: Application) : AndroidViewModel(application
             !MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase)) return false
         if (ConnectionRequestRuntimeGate.legacyStartAllowed()) return false
         val flow = ConnectionRequestMediaHandoff.process.flowFor(handoff) ?: return false
-        if (runCatching { AppMediaRoles.bindReceiver(this, ::stop,
-                { MediaRolePolicy.receiverSwitchAllowed(state.value.home.phase) }) }.isFailure) return false
+        if (!AppMediaRoles.receiverAttached(this)) return false
         val started = request.start(handoff)
         if (started) retainedRequestFlow = flow
         return started
