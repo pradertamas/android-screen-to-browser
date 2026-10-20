@@ -5,6 +5,14 @@ import org.junit.Test
 import java.io.File
 
 class ConnectionWorkflowTest {
+    @Test fun activeShowUsesNormalButtonColorsAndOnlyStopUsesErrorText() {
+        val ui = text("ConnectionWorkflow.kt")
+        val show = ui.substringAfter("Button(onClick = activeShare,").substringBefore("Button(onClick = stopActiveShare,")
+        assertTrue(show.contains("Text(\"Show active share\")"))
+        assertFalse(show.contains("error")); assertFalse(show.contains("colors ="))
+        val stop = ui.substringAfter("Button(onClick = stopActiveShare,").substringBefore("Text(\"Stop active share\")")
+        assertTrue(stop.contains("contentColor = MaterialTheme.colorScheme.error"))
+    }
     private val source = sequenceOf(File("src/main/java/com/pradertamas/uicapturetest"), File("app/src/main/java/com/pradertamas/uicapturetest")).first { it.isDirectory }
     private fun text(name: String) = File(source, name).readText()
     @Test fun workflowIsPresentationOnlyAndUsesExistingRoleAndConnections() {

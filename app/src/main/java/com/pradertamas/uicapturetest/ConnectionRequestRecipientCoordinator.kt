@@ -48,8 +48,9 @@ internal class ConnectionRequestRecipientCoordinator(
 
     fun open(raw: String?, existingFlow: ConnectionRequestRecipientFlow? = null): RecipientAdmission = synchronized(lock) {
         val link = ConnectionRequestLink.parse(raw) ?: return@synchronized RecipientAdmission(error = RecipientEntryError.INVALID)
-        if (existingFlow != null) return@synchronized RecipientAdmission(error =
-            if (hasContext(existingFlow)) RecipientEntryError.CONFLICT else RecipientEntryError.STALE)
+        releaseFinishedCurrent()
+        if (existingFlow != null && (hasContext(existingFlow) || !controller.state.value.idle))
+            return@synchronized RecipientAdmission(error = if (hasContext(existingFlow)) RecipientEntryError.CONFLICT else RecipientEntryError.STALE)
         if (!controller.state.value.idle) return@synchronized RecipientAdmission(error = RecipientEntryError.CONFLICT)
         if (!idle()) return@synchronized RecipientAdmission(error = RecipientEntryError.BUSY)
         arm()
@@ -61,6 +62,16 @@ internal class ConnectionRequestRecipientCoordinator(
         controller.refreshStatus(context) // Exactly one initial capability GET; never Accept on open.
         onControllerState(controller.state.value)
         RecipientAdmission(flow = context)
+    }
+    /** FINISH_NO_CONTEXT never bypasses the current flow's retirement guards. */
+    fun finishWithoutContext(flow: ConnectionRequestRecipientFlow?) = synchronized(lock) {
+        releaseFinishedCurrent()
+        if (flow != null && recipient === flow && controller.recipientAccess(flow) == null) {
+            recipient = null; mutable.value = RecipientUi(RecipientScreen.STALE)
+        }
+    }
+    private fun releaseFinishedCurrent() {
+        controller.mediaSnapshot()?.let { controller.finishMediaFlow(it.flow, release) }
     }
     fun retryStatus(flow: ConnectionRequestRecipientFlow) = synchronized(lock) {
         if (mutable.value.screen != RecipientScreen.CHECK_ERROR || !hasContext(flow)) return@synchronized
@@ -96,7 +107,7 @@ internal class ConnectionRequestRecipientCoordinator(
         val context = recipient ?: return@synchronized
         if (controller.state.value != snapshot) return@synchronized
         val access = controller.recipientAccess(context) ?: run {
-            mutable.value = RecipientUi(RecipientScreen.STALE); return@synchronized
+            recipient = null; mutable.value = RecipientUi(RecipientScreen.STALE); return@synchronized
         }
         val state = snapshot.request?.state
         val screen = when {

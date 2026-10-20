@@ -13,6 +13,7 @@ internal class ProtectedReceiverWire(private val redeem: () -> RequestMediaRedem
         var stopped = false
         var ended = false
         fun end() { if (!stopped && !ended) { ended = true; transport?.close(); events.ended() } }
+        fun unavailable() { if (!stopped && !ended) { ended = true; transport?.close(); events.signalingUnavailable() } }
         transport = ProtectedRequestSignaling.open(redemption.bootstrap, factory, object : ProtectedSignalingEvents {
             override fun registered() { if (!stopped) events.registration("ok") }
             override fun peerPresent() { if (!stopped) events.present() }
@@ -21,6 +22,8 @@ internal class ProtectedReceiverWire(private val redeem: () -> RequestMediaRedem
                 try {
                     val m = JSONObject(text)
                     when (m.getString("type")) {
+                        "peer-left" -> unavailable()
+                        "bye" -> end()
                         "offer" -> events.offer(m.getString("sdp"))
                         "ice" -> m.getJSONObject("candidate").let { c -> events.ice(ReceiverIce(
                             if (c.isNull("sdpMid")) null else c.getString("sdpMid"),
@@ -30,7 +33,8 @@ internal class ProtectedReceiverWire(private val redeem: () -> RequestMediaRedem
                 } catch (_: Exception) { end() }
             }
             override fun failed() = end()
-            override fun closed() = end()
+            override fun transportUnavailable() = unavailable()
+            override fun closed() = unavailable()
         }, dispatch)
         if (ended) transport.close()
         return object : PairingLink {

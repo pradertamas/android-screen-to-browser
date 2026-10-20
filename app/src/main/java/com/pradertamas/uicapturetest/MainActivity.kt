@@ -38,6 +38,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.common.MlKitException
 
 class MainActivity : ComponentActivity() {
+    private val receiverViewerIdentity = Any()
     private lateinit var requestSender: RequestSenderLaunchViewModel
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
     private val requestSetupOwner = ConnectionRequestSetupOwner()
@@ -49,6 +50,7 @@ class MainActivity : ComponentActivity() {
         catch (_: Exception) { AppMediaRoles.receiverStartFailed() }
     }
     private fun traceActivity(event: String, willCallHide: Boolean? = null) {
+        ReceiverSessions.diagnostic("$event component=MainActivity activity=${System.identityHashCode(receiverViewerIdentity)} actualRole=${AppMediaRoles.role}")
         val home = PairingHost.state.value
         ScreenShareLifecycleDiag.write("event=$event lifecycle=${lifecycle.currentState} phase=${home.phase} epoch=${home.epoch} externalUi=$externalUi remoteSharing=$remoteSharing role=${AppMediaRoles.role} captureBusy=${CaptureState.state.value.busy}" + (willCallHide?.let { " willCallHide=$it" } ?: ""))
     }
@@ -68,16 +70,22 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         traceActivity("activity-onStart")
         ReceiverSessions.checkExpiry()
+        ReceiverSessions.mainVisible(receiverViewerIdentity)
         if (AppMediaRoles.role == MediaRole.RECEIVE) {
             if (!ReceiverSessions.state.value.presence.live) openReceiver()
         }
         else if (!CaptureState.state.value.busy) ConnectionRequestRuntimeGate.runLegacyStart { PairingHost.controller.show() }
     }
     override fun onStop() {
+        ReceiverSessions.mainHidden(receiverViewerIdentity, isChangingConfigurations)
         val willCallHide = PairingHost.controller.shouldHideOnStop(externalUi)
         traceActivity("activity-onStop", willCallHide)
         if (willCallHide) PairingHost.controller.hide()
         super.onStop()
+    }
+    override fun onDestroy() {
+        ReceiverSessions.mainDestroyed(receiverViewerIdentity)
+        super.onDestroy()
     }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putLong("consentEpoch", consentEpoch)
@@ -86,6 +94,7 @@ class MainActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ReceiverSessions.mainAttached(receiverViewerIdentity)
         requestSender = ViewModelProvider(this)[RequestSenderLaunchViewModel::class.java]
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, 0)

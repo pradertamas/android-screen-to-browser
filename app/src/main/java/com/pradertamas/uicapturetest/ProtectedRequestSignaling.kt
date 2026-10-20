@@ -60,6 +60,9 @@ internal interface ProtectedSignalingEvents {
     fun payload(text: String)
     fun failed()
     fun closed()
+    fun terminalOrigin(source: String) {}
+    /** Actual socket/I/O loss; existing consumers keep their fatal default policy. */
+    fun transportUnavailable() = failed()
 }
 
 /** Explicit open only. No singleton observer, automatic retry or legacy downgrade.
@@ -106,10 +109,12 @@ internal class ProtectedRequestSignaling private constructor(
         }
     }
     /** Called only during phase one; all socket cleanup is a captured external effect. */
-    private fun MutableList<() -> Unit>.terminal(failure: Boolean, local: Boolean = false) {
+    private fun MutableList<() -> Unit>.terminal(failure: Boolean, local: Boolean = false, unavailable: Boolean = false,
+        source: String = "SIGNALING_PROTOCOL_FAILURE") {
         if (ended) return
         phase = if (failure) Phase.FAILED else Phase.CLOSED
         bootstrap = null; pending.clear()
+        add { runCatching { events.terminalOrigin(source) } }
         add { RequestFlowTrace.record(if (failure) RequestFlowTrace.Event.TRANSPORT_FAILED else RequestFlowTrace.Event.TRANSPORT_CLOSED,
             traceFlow, role, intent = intent) }
         val closing = socket
@@ -117,7 +122,7 @@ internal class ProtectedRequestSignaling private constructor(
             runCatching { closing?.close(if (failure) 1008 else 1000) }
             if (failure) runCatching { closing?.cancel() }
         }
-        pending.add { if (failure) events.failed() else events.closed() }
+        pending.add { if (unavailable) events.transportUnavailable() else if (failure) events.failed() else events.closed() }
     }
     override fun opened(socket: ProtectedSocket) = change {
         if (ended) {
@@ -196,24 +201,25 @@ internal class ProtectedRequestSignaling private constructor(
             val sending = socket
             add {
                 sent = runCatching { sending?.send(text) == true }.getOrDefault(false)
-                if (!sent) failed()
+                if (!sent) fail("SIGNALING_SEND_FAILURE")
             }
         }
         return sent
     }
     override fun binary() = change { terminal(true) }
-    override fun failed() = change {
+    override fun failed() = fail("SIGNALING_FAILURE")
+    private fun fail(source: String) = change {
         if (!ended) add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_FAILURE, traceFlow, role, intent = intent) }
-        terminal(true)
+        terminal(true, unavailable = true, source = source)
     }
     override fun closed(code: Int) = change {
         if (ended) return@change
         add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_REMOTE_CLOSE, traceFlow, role, intent = intent, code = code) }
-        terminal(code != 1000 || phase != Phase.REGISTERED)
+        terminal(code != 1000 || phase != Phase.REGISTERED, source = "SIGNALING_REMOTE_CLOSE")
     }
     fun close() = change {
         if (!ended) add { RequestFlowTrace.record(RequestFlowTrace.Event.SOCKET_LOCAL_CLOSE, traceFlow, role, intent = intent) }
-        terminal(false, local = true)
+        terminal(false, local = true, source = "SIGNALING_LOCAL_STOP")
     }
     override fun toString() = "ProtectedRequestSignaling[redacted]"
     companion object {
@@ -242,7 +248,7 @@ internal class ProtectedRequestSignaling private constructor(
 }
 
 /** No logging interceptor and no automatic retry. Constructed only by an explicit future caller. */
-internal class OkHttpProtectedSocketFactory : ProtectedSocketFactory {
+internal class OkHttpProtectedSocketFactory(private val trace: (String) -> Unit = {}) : ProtectedSocketFactory {
     private val http = OkHttpClient.Builder().retryOnConnectionFailure(false)
         .followRedirects(false).followSslRedirects(false).build()
     internal class Policy(val followRedirects: Boolean, val followSslRedirects: Boolean,
@@ -254,17 +260,24 @@ internal class OkHttpProtectedSocketFactory : ProtectedSocketFactory {
         class Adapter : ProtectedSocket {
             lateinit var ws: WebSocket
             override fun send(text: String) = ws.send(text)
-            override fun close(code: Int) { ws.close(code, null) }
-            override fun cancel() = ws.cancel()
+            override fun close(code: Int) { trace("websocket-local-close code=$code"); ws.close(code, null) }
+            override fun cancel() { trace("websocket-local-cancel"); ws.cancel() }
         }
         val socket = Adapter()
         val ws = http.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) { socket.ws = webSocket; listener.opened(socket) }
+            override fun onOpen(webSocket: WebSocket, response: Response) { trace("websocket-open"); socket.ws = webSocket; listener.opened(socket) }
             override fun onMessage(webSocket: WebSocket, text: String) = listener.text(text)
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) = listener.binary()
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null); listener.closed(code) }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = listener.closed(code)
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { response?.close(); listener.failed() }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                trace("websocket-remote-closing code=$code reason=${ReceiverTrace.safe(reason)}")
+                webSocket.close(code, null); listener.closed(code)
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                trace("websocket-closed code=$code reason=${ReceiverTrace.safe(reason)}"); listener.closed(code)
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                trace("websocket-failure ${ReceiverTrace.exception(t)}"); response?.close(); listener.failed()
+            }
         })
         socket.ws = ws
         return socket

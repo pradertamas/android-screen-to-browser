@@ -15,23 +15,54 @@ internal class ReceiverRendererBinding<T : Any>(private val attachView: (T) -> U
 
 /** Opaque process-local media lifetime, never signaling authority or persisted state. */
 class ReceiverSessionIdentity internal constructor() {
+    /** Intent selector for this process-local lifetime; never persisted or reconstructed from it. */
+    internal val anchorKey = java.util.UUID.randomUUID().toString()
     override fun toString() = "ReceiverSessionIdentity[local]"
 }
 data class ReceiverPresence(val session: ReceiverSessionIdentity? = null,
-    val live: Boolean = false, val visible: Boolean = false, val absentUntilElapsed: Long? = null)
+    val live: Boolean = false, val visible: Boolean = false, val absentUntilElapsed: Long? = null,
+    val backgroundAccepted: Boolean = false)
+
+internal fun receiverMediaAuthority(presence: ReceiverPresence, elapsed: Long): ReceiverMediaAuthority = when {
+    !presence.live || presence.session == null -> ReceiverMediaAuthority.INACTIVE
+    presence.visible -> ReceiverMediaAuthority.FOREGROUND
+    presence.backgroundAccepted && presence.absentUntilElapsed?.let { it > elapsed } == true -> ReceiverMediaAuthority.BACKGROUND
+    else -> ReceiverMediaAuthority.INACTIVE
+}
+
+/** Lifecycle registration only: tokens contain no Activity reference and convey no media ownership. */
+internal class ReceiverViewerBindings {
+    private var receiver: Any? = null
+    private var session: ReceiverSessionIdentity? = null
+    private var main: Any? = null
+    fun attachReceiver(owner: Any, current: ReceiverSessionIdentity?) { receiver = owner; session = current }
+    fun receiverCurrent(owner: Any, current: ReceiverSessionIdentity?) = receiver === owner && session === current
+    fun receiverAttached(owner: Any) = receiver === owner
+    fun receiverSession(current: ReceiverSessionIdentity?) { session = current }
+    fun detachReceiver(owner: Any) { if (receiver === owner) { receiver = null; session = null } }
+    fun attachMain(owner: Any) { main = owner }
+    fun mainCurrent(owner: Any) = main === owner
+    fun detachMain(owner: Any) { if (main === owner) main = null }
+}
 
 /** Main-thread serialized. Network grace remains exclusively ReceiverEngine's concern. */
 internal class ReceiverVisibility(private val elapsed: () -> Long,
     private val later: (Long, () -> Unit) -> (() -> Unit),
     private val changed: (ReceiverPresence) -> Unit,
-    private val stopSession: (ReceiverSessionIdentity) -> Unit) {
+    private val stopSession: (ReceiverSessionIdentity) -> Unit,
+    private val trace: (String) -> Unit = {}) {
     companion object { const val UI_GRACE_MS = 60_000L }
     var state = ReceiverPresence(); private set
+    var lastStopReason: String? = null; private set
     private var viewer: Any? = null
     private var cancel: (() -> Unit)? = null
     private var epoch = 0L
     private fun publish(value: ReceiverPresence) { state = value; changed(value) }
-    private fun invalidate() { epoch++; cancel?.invoke(); cancel = null }
+    private fun invalidate() {
+        epoch++
+        if (cancel != null) trace("deadline-cancelled epoch=$epoch")
+        cancel?.invoke(); cancel = null
+    }
     fun connection(phase: ReceiverPhase) {
         if (phase in setOf(ReceiverPhase.ENDED, ReceiverPhase.ERROR)) {
             invalidate(); publish(ReceiverPresence(visible = viewer != null)); return
@@ -43,13 +74,18 @@ internal class ReceiverVisibility(private val elapsed: () -> Long,
     fun visible(owner: Any) {
         checkExpiry()
         viewer = owner; invalidate()
-        publish(state.copy(visible = true, absentUntilElapsed = null))
+        publish(state.copy(visible = true, absentUntilElapsed = null, backgroundAccepted = false))
+        trace("viewer-foreground token=${System.identityHashCode(owner)} live=${state.live}")
     }
     fun hidden(owner: Any, changingConfiguration: Boolean): Boolean {
-        if (viewer !== owner || changingConfiguration) return false
+        if (viewer !== owner || changingConfiguration) {
+            trace("viewer-background-ignored token=${System.identityHashCode(owner)} config=$changingConfiguration")
+            return false
+        }
         viewer = null
-        publish(state.copy(visible = false))
+        publish(state.copy(visible = false, backgroundAccepted = true))
         if (state.live && state.absentUntilElapsed == null) beginAbsence()
+        trace("viewer-background token=${System.identityHashCode(owner)} live=${state.live}")
         return true
     }
     private fun beginAbsence() {
@@ -62,6 +98,7 @@ internal class ReceiverVisibility(private val elapsed: () -> Long,
         val id = state.session ?: return
         val until = state.absentUntilElapsed ?: return
         val ticket = epoch
+        trace("deadline-scheduled epoch=$ticket until=$until")
         cancel = later((until - elapsed()).coerceAtLeast(0)) {
             if (ticket == epoch && state.session === id && !state.visible) {
                 cancel = null
@@ -73,12 +110,15 @@ internal class ReceiverVisibility(private val elapsed: () -> Long,
         val id = state.session ?: return false
         val until = state.absentUntilElapsed ?: return false
         if (elapsed() < until) return false
+        lastStopReason = "ui-background-timeout"
+        trace("deadline-fired epoch=$epoch until=$until")
         invalidate(); publish(ReceiverPresence(visible = viewer != null)); stopSession(id)
         return true
     }
     fun matches(id: ReceiverSessionIdentity) = state.live && state.session === id && !checkExpiry()
     fun stop(id: ReceiverSessionIdentity): Boolean {
         if (!matches(id)) return false
+        lastStopReason = "user-stop-active-share"
         invalidate(); publish(ReceiverPresence(visible = viewer != null)); stopSession(id)
         return true
     }

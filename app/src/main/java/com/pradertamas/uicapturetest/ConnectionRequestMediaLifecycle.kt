@@ -40,6 +40,9 @@ internal class ConnectionRequestMediaLifecycle(private val controller: Connectio
         val s = controller.mediaSnapshot()
         if (s?.flow !== target) { target = s?.flow; stage = Stage.NEW; retryReconcile = false; mutable.value = RequestCleanupUi() }
         if (s == null || s.phase == RequestMediaPhase.STARTED) return
+        if (controller.finishMediaFlow(s.flow, release)) {
+            mutable.value = RequestCleanupUi(); return
+        }
         if (s.state?.terminal == true && s.phase == null && !s.exitRequested) {
             controller.markMediaExitRequested(s.flow)
         }

@@ -29,7 +29,8 @@ internal class ConnectionRequestSetupCompletion(val revision: Long, val operatio
 internal class ConnectionRequestMediaSnapshot(val flow: Any, val side: ConnectionRequestSide,
     val localRole: MediaRole, val state: ConnectionRequestState?, val won: Boolean,
     val phase: RequestMediaPhase?, val exitRequested: Boolean, val operation: ConnectionRequestOperation?,
-    val exitCompletion: ConnectionRequestSetupCompletion?, val statusCompletion: ConnectionRequestSetupCompletion?)
+    val exitCompletion: ConnectionRequestSetupCompletion?, val statusCompletion: ConnectionRequestSetupCompletion?,
+    val localMediaEnded: Boolean = false)
 
 /** Blocking HTTP lives on a serial worker; all context/publication changes share one lock.
  * No Activity, storage, polling, media-role mutation or automatic session start. */
@@ -48,6 +49,7 @@ class ConnectionRequestController(
         var completion = 0L
         var mediaOwner: RequestMediaOwner? = null
         var exitRequested = false
+        var localMediaEnded = false
         var mediaExitCompletion: ConnectionRequestSetupCompletion? = null
         var completedOperation: ConnectionRequestOperation? = null
         var completionError: ConnectionRequestError? = null
@@ -160,7 +162,8 @@ class ConnectionRequestController(
         context?.takeIf { it.recipientFlow === recipient }?.let { ConnectionRequestRecipientAccess(it.won, it.claim != null) }
     }
     internal fun clearRecipient(recipient: ConnectionRequestRecipientFlow, release: () -> Unit): Boolean = synchronized(lock) {
-        if (context?.recipientFlow !== recipient) return@synchronized false
+        if (context?.recipientFlow !== recipient || context?.mediaOwner?.phase in
+            setOf(RequestMediaPhase.RESERVED, RequestMediaPhase.STARTED)) return@synchronized false
         ++generation; context = null; activeOperation = null; currentCreateAttempt = null; pendingCreateAttempt = null; publish(null)
         release(); true
     }
@@ -243,9 +246,14 @@ class ConnectionRequestController(
         mediaRevision.value++
     }
     internal fun mediaDisposed(owner: RequestMediaOwner) = synchronized(lock) {
+        if (owner.phase == RequestMediaPhase.DISPOSED) return@synchronized
+        val started = owner.phase == RequestMediaPhase.STARTED
         owner.phase = RequestMediaPhase.DISPOSED
         // A failed/stopped media owner must never be automatically restarted for this flow.
-        if (matches(context, owner.flow) && context?.mediaOwner === owner) context?.exitRequested = true
+        if (matches(context, owner.flow) && context?.mediaOwner === owner) {
+            context?.exitRequested = true
+            if (started) context?.localMediaEnded = true
+        }
         mediaRevision.value++
     }
     internal fun mediaSnapshot(): ConnectionRequestMediaSnapshot? = synchronized(lock) {
@@ -254,7 +262,7 @@ class ConnectionRequestController(
         ConnectionRequestMediaSnapshot(flow, c.side,
             if (c.side == ConnectionRequestSide.INITIATOR) c.role else ConnectionRequestSetupCoordinator.opposite(c.role),
             c.metadata?.state, c.won, c.mediaOwner?.phase, c.exitRequested, activeOperation,
-            c.mediaExitCompletion, c.setupCompletions[ConnectionRequestOperation.STATUS])
+            c.mediaExitCompletion, c.setupCompletions[ConnectionRequestOperation.STATUS], c.localMediaEnded)
     }
     internal fun markMediaExitRequested(flow: Any): Boolean = synchronized(lock) {
         val c = context ?: return@synchronized false
@@ -263,13 +271,45 @@ class ConnectionRequestController(
         c.exitRequested = true; mediaRevision.value++; true
     }
     /** Only a short synchronous gate policy callback; never media/UI/network under this lock. */
-    internal fun finishMediaFlow(flow: Any, release: () -> Unit): Boolean = synchronized(lock) {
-        val c = context ?: return@synchronized false
-        if (!matches(c, flow) || activeOperation != null ||
-            c.mediaOwner?.phase !in setOf(null, RequestMediaPhase.DISPOSED) ||
-            (c.metadata?.state?.terminal != true && c.metadata?.state != ConnectionRequestState.CONNECTED) ||
-            (c.mediaOwner == null && !c.exitRequested)) return@synchronized false
-        clear(); release(); true
+    internal fun finishMediaFlow(flow: Any, release: () -> Unit): Boolean {
+        val retired = synchronized(lock) {
+            val c = context ?: return@synchronized null
+            if (!matches(c, flow) || c.mediaOwner?.phase !in setOf(null, RequestMediaPhase.DISPOSED)) return@synchronized null
+            val endedMedia = c.localMediaEnded && c.mediaOwner?.phase == RequestMediaPhase.DISPOSED
+            val terminal = c.metadata?.state?.terminal == true
+            val unavailable = activeOperation == null && mutable.value.error == ConnectionRequestError.UNAVAILABLE
+            val completedExit = c.metadata?.state == ConnectionRequestState.CONNECTED && (c.mediaOwner != null || c.exitRequested)
+            if (!endedMedia && !terminal && !unavailable && !(completedExit && activeOperation == null)) return@synchronized null
+            // The local media lifetime is definitively over. A stale CONNECTING snapshot or
+            // failed cleanup HTTP must not keep owning the next connection workflow.
+            // Keep at most one best-effort exit, with the retired identity/credentials only.
+            val cleanup = if (endedMedia && c.mediaExitCompletion == null &&
+                activeOperation !in setOf(ConnectionRequestOperation.CANCEL, ConnectionRequestOperation.WITHDRAW)) {
+                when {
+                    c.side == ConnectionRequestSide.INITIATOR && c.metadata?.state?.activeSetup == true -> ConnectionRequestOperation.CANCEL
+                    c.side == ConnectionRequestSide.RECIPIENT && c.won &&
+                        c.metadata?.state in setOf(ConnectionRequestState.ACCEPTED, ConnectionRequestState.CONNECTING) -> ConnectionRequestOperation.WITHDRAW
+                    else -> null
+                }
+            } else null
+            clear() // Invalidate queued/in-flight HTTP before another flow can be admitted.
+            release()
+            c to cleanup
+        } ?: return false
+        val (old, cleanup) = retired
+        val localRole = if (old.side == ConnectionRequestSide.INITIATOR) old.role else ConnectionRequestSetupCoordinator.opposite(old.role)
+        RequestFlowTrace.record(RequestFlowTrace.Event.OWNERSHIP_RETIRED, flow, localRole,
+            ConnectionRequestUiState(old.side, old.metadata))
+        if (cleanup != null) worker.execute {
+            val result = safe {
+                if (cleanup == ConnectionRequestOperation.CANCEL) api.cancel(old.id, checkNotNull(old.initiatorSecret))
+                else api.withdraw(old.id, checkNotNull(old.claim))
+            }
+            // Diagnostic completion only: never publish into the new current context.
+            RequestFlowTrace.record(RequestFlowTrace.Event.RETIRED_EXIT_COMPLETE, flow, localRole,
+                ConnectionRequestUiState(old.side, result.metadata, cleanup, result.error), code = result.httpStatus)
+        }
+        return true
     }
     internal fun mediaPhase(owner: RequestMediaOwner): RequestMediaPhase = synchronized(lock) { owner.phase }
     internal fun mediaPhaseForFlow(flow: Any): RequestMediaPhase? = synchronized(lock) {
@@ -417,7 +457,9 @@ class ConnectionRequestController(
             if (!synchronized(lock) { generation == token && context === c }) return@execute
             val result = safe { call(c) }
             // Worker boundary, outside controller lock. Whitelist metadata, never log auth/body.
-            RequestFlowTrace.record(RequestFlowTrace.Event.HTTP_COMPLETE, c.originAttempt ?: c.recipientFlow,
+            val stillCurrent = synchronized(lock) { generation == token && context === c }
+            RequestFlowTrace.record(if (stillCurrent) RequestFlowTrace.Event.HTTP_COMPLETE else RequestFlowTrace.Event.STALE_HTTP_COMPLETE,
+                c.originAttempt ?: c.recipientFlow,
                 role = if (c.side == ConnectionRequestSide.INITIATOR) c.role else ConnectionRequestSetupCoordinator.opposite(c.role),
                 state = ConnectionRequestUiState(c.side, result.metadata, op, result.error), code = result.httpStatus)
             synchronized(lock) {

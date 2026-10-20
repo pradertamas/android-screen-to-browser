@@ -21,6 +21,7 @@ class ConnectionRequestActivity : ComponentActivity() {
     private lateinit var requestSender: RequestSenderLaunchViewModel
     private val setupOwner = ConnectionRequestSetupOwner()
     private fun finishRequest(reason: RequestFlowTrace.Event) {
+        if (reason == RequestFlowTrace.Event.FINISH_NO_CONTEXT) coordinator.finishWithoutContext(model.flow)
         RequestFlowTrace.record(reason, model.flow, AppMediaRoles.role, ConnectionRequests.controller.state.value)
         finish()
     }

@@ -13,7 +13,7 @@ class ReceiverRendererSessionTest {
     @get:Rule val activity = createAndroidComposeRule<ComponentActivity>()
     @Test fun replacingAndReleasingActivityRenderersKeepsNativePeerUntilExplicitClose() {
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            val session = WebRtcReceiverSession(activity.activity.application, {}, {}, {}, {}, { _, _ -> }, {})
+            val session = WebRtcReceiverSession(activity.activity.application, {}, { _, _ -> }, {}, {}, { _, _ -> }, {})
             fun field(name: String) = session.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(session)
             try {
                 val peer = field("peer"); assertNotNull(peer)

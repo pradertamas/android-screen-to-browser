@@ -82,14 +82,14 @@ class ConnectionRequestRuntimeGateTest {
         val text = source("ReceiverSessionCoordinator")
         assertGuarded(text, "engine.create()"); assertGuarded(text, "engine.join(value)")
         val regions = guardedRegions(text)
-        for (call in listOf("AppMediaRoles.bindReceiver(", "engine.stop()")) {
+        for (call in listOf("AppMediaRoles.bindReceiver(", "engine.stop(reason, intentional)")) {
             val index = text.indexOf(call); assertTrue(index >= 0); assertFalse(regions.any { index in it })
         }
     }
     @Test fun hideCloseAndReceiverStopRemainOutsideGate() {
         for ((name, calls) in listOf("MainActivity" to listOf("PairingHost.controller.hide()"),
             "AppMediaRoles" to listOf("PairingHost.controller.hide()", "PairingHost.controller.close()"),
-            "ReceiverSessionCoordinator" to listOf("engine.stop()"))) {
+            "ReceiverSessionCoordinator" to listOf("engine.stop(reason, intentional)"))) {
             val text = source(name); val regions = guardedRegions(text)
             for (call in calls) for (match in Regex(Regex.escape(call)).findAll(text)) assertFalse(regions.any { match.range.first in it })
         }

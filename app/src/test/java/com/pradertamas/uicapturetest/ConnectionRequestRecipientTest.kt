@@ -21,6 +21,30 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.collect
 
 class ConnectionRequestRecipientTest {
+    @Test fun staleActivityFlowCanOpenFreshLinkAfterTerminalOwnershipIsRetired() {
+        val f = Fixture(); val model = ConnectionRequestActivityViewModel()
+        model.opened(f.coordinator.open(link())); f.finish(); val old = model.flow!!
+        model.mediaTransferred = true; model.exiting = true
+        f.serverState = "FAILED"; f.controller.refreshStatus(old); f.finish()
+        f.serverState = "WAITING"
+        val admitted = f.coordinator.open(link(), model.flow)
+        assertNull(admitted.error); model.opened(admitted); f.finish()
+        val fresh = model.flow!!; assertNotSame(old, fresh)
+        assertFalse(model.mediaTransferred); assertFalse(model.exiting); assertFalse(model.receiverTransfer.transferred)
+        assertEquals(RecipientScreen.WAITING, f.coordinator.projection(fresh).screen)
+        assertEquals(1, f.events.count { it == "release" }); assertFalse(f.gate.legacyStartAllowed())
+        val current = f.controller.state.value
+        f.coordinator.finishWithoutContext(old); f.coordinator.close(old); f.controller.refreshStatus(old); f.finish()
+        assertEquals(current, f.controller.state.value); assertTrue(f.coordinator.hasContext(fresh))
+    }
+    @Test fun missingServerRequestCanBeRetiredBeforeOpeningNextLinkWithoutClearingIdentity() {
+        val f = Fixture(); f.statusError = 404; f.open(); f.finish()
+        assertEquals(ConnectionRequestError.UNAVAILABLE, f.controller.state.value.error)
+        f.statusError = null
+        assertNull(f.open()); f.finish()
+        assertEquals(RecipientScreen.WAITING, f.coordinator.state.value.screen)
+        assertEquals(1, f.events.count { it == "release" })
+    }
     private fun token(bytes: Int, seed: Int) = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(bytes) { seed.toByte() })
     private val id = token(16, 1)
     private val cap = token(16, 2)

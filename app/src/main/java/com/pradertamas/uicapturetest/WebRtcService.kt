@@ -42,9 +42,12 @@ class WebRtcService : Service() {
     private val thread = HandlerThread("WebRtcControl")
     private lateinit var handler: Handler
     private var closing = false
+    private val signalingPolicy = SenderMediaSignalingPolicy()
     private var disposed = false
     private var destroyed = false
     private var started = false
+    private val mediaTrace = MediaAttemptDiagnostics("SEND", SystemClock::elapsedRealtime,
+        { Log.i("MediaAttempt", it) }, schedulingClock = SystemClock::uptimeMillis)
     private var factory: PeerConnectionFactory? = null
     private var egl: EglBase? = null
     private var helper: SurfaceTextureHelper? = null
@@ -62,7 +65,7 @@ class WebRtcService : Service() {
     private var userStatus = "Connecting"
     private var addressFamily = "N/A"
     private var bytesAvailable = false
-    private val directTimeout = Runnable { finish("Direct connection could not be established.") }
+    private val directTimeout = Runnable { finish("Direct connection could not be established.", mediaTrace.timeoutFired()) }
     private val pendingIce = mutableListOf<IceCandidate>()
     private var offered = false
     private var remoteSet = false
@@ -92,12 +95,13 @@ class WebRtcService : Service() {
             handler.postDelayed(this, 1000)
         }
     }
-    override fun onCreate() { super.onCreate(); thread.start(); handler = Handler(thread.looper) }
+    override fun onCreate() { super.onCreate(); thread.start(); handler = Handler(thread.looper); mediaTrace.event("SERVICE_CREATE") }
     override fun onBind(intent: Intent?) = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == STOP) { handler.post { finish("Stopped") }; return START_NOT_STICKY }
+        if (intent?.action == STOP) { handler.post { finish("Stopped", "EXPLICIT_USER_STOP") }; return START_NOT_STICKY }
         if (intent?.action != START || started) { if (!started) stopSelf(); return START_NOT_STICKY }
         started = true
+        mediaTrace.event("SERVICE_START")
         // Capture only local cleanup selectors BEFORE any fallible validation/consent read.
         val requestedMode = runCatching { SenderStartMode.valueOf(intent.getStringExtra(MODE) ?: "LEGACY") }.getOrNull()
         val handoff = if (requestedMode == SenderStartMode.REQUEST)
@@ -144,6 +148,7 @@ class WebRtcService : Service() {
             captureBeforeRequestSignaling({ initializeCapture(consent); check(!projectionEnded.get()) }, {
                 ConnectionRequestMediaHandoff.process.consume(checkNotNull(startCleanup?.handoffId), MediaRole.SEND)
             }) { redemption ->
+                mediaTrace.correlate(redemption.owner.flow)
                 checkNotNull(startCleanup).redeemed(redemption.owner)
                 pairingIntent = redemption.bootstrap.intent
                 channel = ProtectedSenderSignalingChannel(redemption.bootstrap, dispatch = { action -> handler.post { action() } })
@@ -157,6 +162,7 @@ class WebRtcService : Service() {
         handler.post(ticker)
     }
     private fun initializeCapture(consent: Intent) {
+        mediaTrace.event("CAPTURE_START")
         startedAt = SystemClock.elapsedRealtime(); previousAt = startedAt
         PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
         egl = EglBase.create()
@@ -179,13 +185,14 @@ class WebRtcService : Service() {
                     source?.adaptOutputFormat(size.width, size.height, CaptureDimensions.FPS)
                     capturer?.changeCaptureFormat(size.width, size.height, CaptureDimensions.FPS)
                 }
-                catch (_: Exception) { finish("Capture resize failed") }
+                catch (_: Exception) { finish("Capture resize failed", "CAPTURE_FAILURE") }
             } else captureResize?.stop()
         }).also { it.start() }
         capturer = ScreenCapturerAndroid(consent, object : MediaProjection.Callback() {
             override fun onStop() {
                 projectionEnded.set(true)
-                handler.post { finish("Projection stopped by system") }
+                mediaTrace.event("PROJECTION_STOP_CALLBACK")
+                handler.post { finish("Projection stopped by system", "PROJECTION_STOP") }
             }
             // libwebrtc registers this callback on its SurfaceTextureHelper thread.
             // Never resize inline here: changeCaptureFormat synchronously marshals to
@@ -198,6 +205,7 @@ class WebRtcService : Service() {
         capturer!!.startCapture(CaptureDimensions.INITIAL.width,
             CaptureDimensions.INITIAL.height, CaptureDimensions.FPS)
         track = factory!!.createVideoTrack("screen", source)
+        mediaTrace.event("CAPTURE_READY")
     }
     private fun openSignaling() {
         checkNotNull(channel).open(object : SenderSignalingEvents {
@@ -206,7 +214,11 @@ class WebRtcService : Service() {
             override fun payload(text: String) {
                 if (!closing) try { receive(JSONObject(text)) } catch (_: Exception) { finish("Connection failed") }
             }
-            override fun ended() { if (!closing) finish("Disconnected") }
+            override fun terminalOrigin(source: String) {
+                mediaTrace.event("SIGNALING_TERMINAL_ORIGIN", "source=$source")
+            }
+            override fun signalingEnded(source: String) { signalingEnded(source, "Disconnected") }
+            override fun ended() { if (!closing) finish("Disconnected", "SIGNALING_FAILURE") }
         })
     }
     private fun setStatus(status: String) {
@@ -221,22 +233,23 @@ class WebRtcService : Service() {
             iceTransportsType = PeerConnection.IceTransportsType.ALL
         }
         peer = checkNotNull(factory!!.createPeerConnection(config, object : PeerConnection.Observer {
-            override fun onSignalingChange(s: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) {}
+            override fun onSignalingChange(s: PeerConnection.SignalingState) { mediaTrace.state("SIGNALING", s.name) }
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) { mediaTrace.state("ICE", s.name) }
             override fun onConnectionChange(s: PeerConnection.PeerConnectionState) {
+                mediaTrace.state("PEER", s.name)
                 handler.post {
                     if (closing) return@post
                     when (s) {
-                        PeerConnection.PeerConnectionState.CONNECTED -> { handler.removeCallbacks(directTimeout); setStatus("Streaming"); channel?.streaming() }
-                        PeerConnection.PeerConnectionState.DISCONNECTED -> { setStatus("Disconnected"); handler.postDelayed(directTimeout, 15_000) }
-                        PeerConnection.PeerConnectionState.FAILED -> finish("Direct connection could not be established.")
+                        PeerConnection.PeerConnectionState.CONNECTED -> { signalingPolicy.connected(); handler.removeCallbacks(directTimeout); mediaTrace.timeoutsCancelled("peer-connected"); setStatus("Streaming"); channel?.streaming() }
+                        PeerConnection.PeerConnectionState.DISCONNECTED -> { setStatus("Disconnected"); mediaTrace.timeoutArmed(true, 15_000); handler.postDelayed(directTimeout, 15_000) }
+                        PeerConnection.PeerConnectionState.FAILED -> finish("Direct connection could not be established.", "PEER_FAILED")
                         else -> Unit
                     }
                 }
             }
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState) {}
-            override fun onIceCandidate(c: IceCandidate) { handler.post {
+            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState) { mediaTrace.state("GATHERING", s.name) }
+            override fun onIceCandidate(c: IceCandidate) { mediaTrace.local(c.sdp); handler.post {
                 send(JSONObject().put("type", "ice").put("candidate", JSONObject().put("candidate", c.sdp)
                     .put("sdpMid", c.sdpMid).put("sdpMLineIndex", c.sdpMLineIndex)))
             } }
@@ -246,27 +259,41 @@ class WebRtcService : Service() {
             override fun onDataChannel(d: DataChannel) {}
             override fun onRenegotiationNeeded() {}
         }))
+        mediaTrace.peerCreated()
         val sender = peer!!.addTrack(track, listOf("screen-stream"))
         val parameters = sender.parameters
         parameters.encodings.forEach { it.maxBitrateBps = 2_000_000; it.maxFramerate = 30 }
         check(sender.setParameters(parameters)) { "Cannot apply sender video profile" }
-        peer!!.createOffer(observer { s -> peer!!.setLocalDescription(observer {
-            send(JSONObject().put("type", "offer").put("sdp", s!!.description))
-        }, s) }, MediaConstraints())
+        mediaTrace.sdp("CREATE_OFFER", "START")
+        peer!!.createOffer(observer("CREATE_OFFER") { s ->
+            mediaTrace.sdp("SET_LOCAL_OFFER", "START")
+            peer!!.setLocalDescription(observer("SET_LOCAL_OFFER") {
+                mediaTrace.sdp("SEND_OFFER", "START")
+                send(JSONObject().put("type", "offer").put("sdp", s!!.description))
+            }, s)
+        }, MediaConstraints())
     }
     private fun send(message: JSONObject) {
-        if (closing) return
+        if (closing) {
+            if (message.optString("type") == "ice") mediaTrace.sent(message.optJSONObject("candidate")?.optString("candidate").orEmpty(), false)
+            return
+        }
         val text = message.toString()
         if (text.toByteArray(Charsets.UTF_8).size >= 64 * 1024) {
+            if (message.optString("type") == "ice") mediaTrace.sent(message.optJSONObject("candidate")?.optString("candidate").orEmpty(), false)
+            if (message.optString("type") == "offer") mediaTrace.sdp("SEND_OFFER", "FAILURE", "payload-size")
             handler.post { finish("Signaling payload too large") }; return
         }
-        if (channel?.send(text) != true) handler.post { finish("Signaling unavailable") }
+        val admitted = !signalingPolicy.degraded && channel?.send(text) == true
+        if (message.optString("type") == "ice") mediaTrace.sent(message.optJSONObject("candidate")?.optString("candidate").orEmpty(), admitted)
+        if (message.optString("type") == "offer") mediaTrace.sdp("SEND_OFFER", if (admitted) "SUCCESS" else "FAILURE")
+        if (!admitted) handler.post { signalingEnded("SIGNALING_SEND_FAILURE", "Signaling unavailable") }
     }
-    private fun observer(done: (SessionDescription?) -> Unit = {}) = object : SdpObserver {
-        override fun onCreateSuccess(s: SessionDescription) { handler.post { if (!closing) try { done(s) } catch (_: Exception) { finish("SDP failed") } } }
-        override fun onSetSuccess() { handler.post { if (!closing) try { done(null) } catch (_: Exception) { finish("SDP failed") } } }
-        override fun onCreateFailure(error: String) { handler.post { finish("SDP failed") } }
-        override fun onSetFailure(error: String) { handler.post { finish("SDP failed") } }
+    private fun observer(operation: String, done: (SessionDescription?) -> Unit = {}) = object : SdpObserver {
+        override fun onCreateSuccess(s: SessionDescription) { mediaTrace.sdp(operation, "SUCCESS"); handler.post { if (!closing) try { done(s) } catch (_: Exception) { finish("SDP failed", "SDP_FAILURE") } } }
+        override fun onSetSuccess() { mediaTrace.sdp(operation, "SUCCESS"); handler.post { if (!closing) try { done(null) } catch (_: Exception) { finish("SDP failed", "SDP_FAILURE") } } }
+        override fun onCreateFailure(error: String) { mediaTrace.sdp(operation, "FAILURE", "native-create-failure"); handler.post { finish("SDP failed", "SDP_FAILURE") } }
+        override fun onSetFailure(error: String) { mediaTrace.sdp(operation, "FAILURE", "native-set-failure"); handler.post { finish("SDP failed", "SDP_FAILURE") } }
     }
     private fun receive(m: JSONObject) {
         when (m.getString("type")) {
@@ -274,23 +301,41 @@ class WebRtcService : Service() {
                 check(registered)
                 offered = true
                 setStatus("Browser connected")
-                handler.postDelayed(directTimeout, 45_000)
+                mediaTrace.timeoutArmed(false, 45_000); handler.postDelayed(directTimeout, 45_000)
                 createPeerAndOffer()
                 setStatus("Starting stream")
             }
             "answer" -> if (offered && !remoteSet) {
-                peer!!.setRemoteDescription(observer {
+                mediaTrace.sdp("RECEIVE_ANSWER", "START")
+                mediaTrace.sdp("RECEIVE_ANSWER", "SUCCESS")
+                mediaTrace.sdp("SET_REMOTE_ANSWER", "START")
+                peer!!.setRemoteDescription(observer("SET_REMOTE_ANSWER") {
                     remoteSet = true
-                    pendingIce.forEach { peer!!.addIceCandidate(it) }; pendingIce.clear()
+                    mediaTrace.flush(true, pendingIce.size)
+                    pendingIce.forEach { mediaTrace.flushedCandidate(); applyIce(it) }; pendingIce.clear()
+                    mediaTrace.flush(false, pendingIce.size)
                 }, SessionDescription(SessionDescription.Type.ANSWER, m.getString("sdp")))
             }
             "ice" -> {
+                mediaTrace.event("REMOTE_CANDIDATE_ARRIVAL", "peerExists=${peer != null} remoteReady=$remoteSet queue=${pendingIce.size}")
                 check(peer != null)
                 val c = m.getJSONObject("candidate")
                 val ice = IceCandidate(c.optString("sdpMid", "0"), c.getInt("sdpMLineIndex"), c.getString("candidate"))
-                if (remoteSet) peer!!.addIceCandidate(ice) else { check(pendingIce.size < 256); pendingIce.add(ice) }
+                mediaTrace.received(ice.sdp, remoteSet, pendingIce.size)
+                if (remoteSet) applyIce(ice) else { check(pendingIce.size < 256); pendingIce.add(ice); mediaTrace.queued(pendingIce.size) }
             }
-            "bye", "peer-left" -> finish("Disconnected")
+            "bye" -> finish("Disconnected", "SIGNALING_REMOTE_BYE")
+            "peer-left" -> signalingEnded("SIGNALING_PEER_LEFT", "Disconnected")
+        }
+    }
+    private fun applyIce(candidate: IceCandidate) {
+        mediaTrace.applyAttempt(candidate.sdp, remoteSet, pendingIce.size)
+        try {
+            val accepted = peer!!.addIceCandidate(candidate)
+            mediaTrace.applyResult(candidate.sdp, accepted, remoteSet, pendingIce.size)
+        } catch (e: Exception) {
+            mediaTrace.applyResult(candidate.sdp, false, remoteSet, pendingIce.size)
+            throw e
         }
     }
     private fun collectStats() {
@@ -322,6 +367,8 @@ class WebRtcService : Service() {
             ?: nominated.singleOrNull() // Do not guess between multiple nominated pairs.
         val local = report.statsMap[pair?.members?.get("localCandidateId") as? String]?.members.orEmpty()
         val remote = report.statsMap[pair?.members?.get("remoteCandidateId") as? String]?.members.orEmpty()
+        mediaTrace.selectedPair(pair != null, local["candidateType"], remote["candidateType"], local["protocol"],
+            pair?.members?.get("nominated") == true, pair?.members?.get("state") == "succeeded")
         candidate = "${local["candidateType"] ?: "N/A"} / ${remote["candidateType"] ?: "N/A"}"
         protocol = local["protocol"]?.toString() ?: "N/A"
         addressFamily = "${addressFamily(local["address"] ?: local["ip"])} / ${addressFamily(remote["address"] ?: remote["ip"])}"
@@ -353,13 +400,33 @@ class WebRtcService : Service() {
             "Capture bounds: 720 × 1560 portrait / 1560 × 720 landscape / 30 FPS / max 2 Mbps\n" +
             "Candidate local / remote: $candidate\nProtocol: $protocol\nAverage RTT: ${if (rttCount > 0) fmt(rttTotal / rttCount) else "N/A"} ms\nMaximum RTT: ${if (rttCount > 0) fmt(rttMax) else "N/A"} ms"
     }
-    private fun finish(reason: String) {
+    private fun terminalDiagnostic(source: String, reason: String) {
+        mediaTrace.terminal(source, reason, "started=$started closing=$closing disposed=$disposed destroyed=$destroyed projectionStopped=${projectionEnded.get()} captureExists=${capturer != null}")
+    }
+    private fun signalingEnded(source: String, reason: String) {
         if (closing) return
+        if (signalingPolicy.retain(source, peer?.connectionState()?.name)) {
+            channel?.close()
+            mediaTrace.event("SIGNALING_DEGRADED", "source=$source mediaEstablished=true session-retained")
+            return // Do not touch media ownership or either existing disconnect deadline.
+        }
+        finish(reason, source)
+    }
+    private fun finish(reason: String, source: String = "OTHER") {
+        if (closing) return
+        terminalDiagnostic(source, when (reason) {
+            "Screen sharing could not start." -> "startup-failed"
+            "Direct connection could not be established." -> "direct-connection-ended"
+            "SDP failed" -> "sdp-failed"
+            "Stopped" -> "stopped"
+            else -> "local-finish"
+        })
         runCatching { send(JSONObject().put("type", "bye")) }
-        closing = true; channel?.close(); handler.removeCallbacks(ticker)
+        closing = true; signalingPolicy.stop(); channel?.close(); handler.removeCallbacks(ticker)
         finalContent = captureResize?.content; finalOutput = captureResize?.output
         captureResize?.stop()
         handler.removeCallbacks(directTimeout)
+        mediaTrace.timeoutsCancelled("finish")
         // Take a final counter snapshot before disposing. Bound the wait if native stats do not return.
         val pc = peer
         if (pc == null) { completeFinish(reason); return }
@@ -374,6 +441,7 @@ class WebRtcService : Service() {
     private fun completeFinish(reason: String) {
         if (disposed) return
         disposed = true
+        mediaTrace.summary()
         val snapshot = if (startedAt > 0) summary(SystemClock.elapsedRealtime()) else WebRtcState.state.value.metrics
         peer?.close(); peer?.dispose(); peer = null
         runCatching { capturer?.stopCapture() }.onFailure { if (mode == SenderStartMode.LEGACY) Log.w("WebRtcPoC", "Capture stop", it) }
@@ -395,9 +463,10 @@ class WebRtcService : Service() {
         thread.quitSafely()
     }
     override fun onDestroy() {
+        mediaTrace.event("SERVICE_DESTROY_CALLBACK")
         handler.post {
             destroyed = true
-            finish("Stopped")
+            finish("Stopped", "SERVICE_DESTROY")
             if (disposed) releaseControlThread()
         }
         super.onDestroy()

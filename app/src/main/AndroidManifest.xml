@@ -4,6 +4,8 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -24,6 +26,10 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
         <service android:name=".WebRtcService" android:exported="false" android:foregroundServiceType="mediaProjection" />
+        <service android:name=".ReceiverExecutionAnchorService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-started live screen-share receiver; retain the existing native media session during its bounded UI-absence window while rendering is detached. No screen capture or media recovery." />
+        </service>
         <activity android:name=".ConnectionRequestActivity" android:exported="true" android:launchMode="singleTop" android:theme="@style/Theme.PairingInvite">
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />

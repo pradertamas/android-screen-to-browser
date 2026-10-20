@@ -8,6 +8,10 @@ internal interface SenderSignalingEvents {
     fun peerPresent()
     fun payload(text: String)
     fun ended()
+    /** Operational cause delivered before the media owner decides whether to end media. */
+    fun signalingEnded(source: String) { ended() }
+    /** Observation only, before the existing terminal side effects. */
+    fun terminalOrigin(source: String) {}
 }
 internal interface SenderSignalingChannel {
     fun open(events: SenderSignalingEvents)
@@ -66,7 +70,7 @@ internal class ProtectedSenderSignalingChannel(private val bootstrap: ProtectedS
     private var closed = false
     override fun open(events: SenderSignalingEvents) {
         check(!opened && !closed && bootstrap.role == MediaRole.SEND); opened = true
-        fun end() { if (!closed) { closed = true; transport?.close(); events.ended() } }
+        fun end(source: String) { if (!closed) { runCatching { events.terminalOrigin(source) }; closed = true; transport?.close(); events.signalingEnded(source) } }
         transport = ProtectedRequestSignaling.open(bootstrap, factory, object : ProtectedSignalingEvents {
             override fun registered() { if (!closed) events.registered() }
             override fun peerPresent() { if (!closed) events.peerPresent() }
@@ -74,11 +78,15 @@ internal class ProtectedSenderSignalingChannel(private val bootstrap: ProtectedS
                 if (closed) return
                 when (JSONObject(text).getString("type")) {
                     "answer", "ice" -> events.payload(text)
-                    else -> end()
+                    "bye" -> end("SIGNALING_REMOTE_BYE")
+                    "peer-left" -> end("SIGNALING_PEER_LEFT")
+                    else -> end("SIGNALING_PROTOCOL_FAILURE")
                 }
             }
-            override fun failed() = end()
-            override fun closed() = end()
+            override fun terminalOrigin(source: String) { if (!closed) events.terminalOrigin(source) }
+            override fun failed() = end("SIGNALING_PROTOCOL_FAILURE")
+            override fun transportUnavailable() = end("SIGNALING_FAILURE")
+            override fun closed() = end("SIGNALING_REMOTE_CLOSE")
         }, dispatch)
         if (closed) transport?.close()
     }

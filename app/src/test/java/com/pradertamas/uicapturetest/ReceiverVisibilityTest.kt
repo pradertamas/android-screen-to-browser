@@ -4,6 +4,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverVisibilityTest {
+    @Test fun mediaAuthorityRequiresAcceptedBackgroundAndUnexpiredCurrentLifetime() {
+        val hidden = ReceiverPresence(ReceiverSessionIdentity(), true, false, 60000)
+        assertEquals(ReceiverMediaAuthority.INACTIVE, receiverMediaAuthority(hidden, 0))
+        val accepted = hidden.copy(backgroundAccepted = true)
+        assertEquals(ReceiverMediaAuthority.BACKGROUND, receiverMediaAuthority(accepted, 59999))
+        assertEquals(ReceiverMediaAuthority.INACTIVE, receiverMediaAuthority(accepted, 60000))
+        assertEquals(ReceiverMediaAuthority.FOREGROUND, receiverMediaAuthority(accepted.copy(visible = true), 0))
+        assertEquals(ReceiverMediaAuthority.INACTIVE, receiverMediaAuthority(accepted.copy(live = false), 0))
+    }
+    @Test fun staleReceiverForegroundAndDestroyCannotAcquireReplacementAuthority() {
+        val bindings = ReceiverViewerBindings()
+        val old = Any(); val fresh = Any(); val a = ReceiverSessionIdentity(); val b = ReceiverSessionIdentity()
+        bindings.attachReceiver(old, a); assertTrue(bindings.receiverCurrent(old, a))
+        bindings.attachReceiver(fresh, b); bindings.detachReceiver(old)
+        assertFalse(bindings.receiverCurrent(old, b)); assertFalse(bindings.receiverCurrent(old, a))
+        assertFalse(bindings.receiverCurrent(fresh, a)); assertTrue(bindings.receiverCurrent(fresh, b))
+        val f = Fixture(); f.live(); f.hide(); val deadline = f.life.state.absentUntilElapsed
+        if (bindings.receiverCurrent(old, f.life.state.session)) f.life.visible(old)
+        assertEquals(deadline, f.life.state.absentUntilElapsed); assertFalse(f.life.state.visible)
+    }
+    @Test fun replacementMainRegistrationRejectsStaleForegroundAndDestroy() {
+        val bindings = ReceiverViewerBindings(); val old = Any(); val current = Any()
+        bindings.attachMain(old); bindings.attachMain(current); bindings.detachMain(old)
+        assertFalse(bindings.mainCurrent(old)); assertTrue(bindings.mainCurrent(current))
+        bindings.detachMain(current); assertFalse(bindings.mainCurrent(current))
+    }
     private class Fixture {
         data class Task(val due: Long, val run: () -> Unit, var canceled: Boolean = false)
         var now = 0L; val tasks = mutableListOf<Task>(); val ended = mutableListOf<ReceiverSessionIdentity>()
@@ -22,6 +48,22 @@ class ReceiverVisibilityTest {
         f.now = 20000; f.life.visible(Any())
         f.tasks.single().run(); assertSame(id, f.life.state.session)
         assertTrue(f.life.state.visible); assertNull(f.life.state.absentUntilElapsed); assertTrue(f.ended.isEmpty())
+    }
+    @Test fun returnToMainCancelsOldDeadlineAndLeavingMainStartsOneFreshWindow() {
+        val f = Fixture(); f.live(); val id = f.life.state.session
+        f.hide(); val old = f.tasks.single()
+        val main = Any()
+        f.now = 20000; f.life.visible(main)
+        // Late ReceiverActivity stop/destroy must not hide the foreground Main viewer.
+        assertFalse(f.life.hidden(f.viewer, false))
+        f.now = 60000; old.run()
+        assertTrue(f.life.state.live); assertSame(id, f.life.state.session)
+        assertNull(f.life.state.absentUntilElapsed); assertTrue(f.ended.isEmpty())
+        f.life.hidden(main, false)
+        f.life.hidden(main, false) // Duplicate lifecycle callback does not create another timer.
+        assertEquals(2, f.tasks.size); assertEquals(120000L, f.life.state.absentUntilElapsed)
+        f.now = 120000; f.tasks.last().run(); f.tasks.last().run()
+        assertEquals(listOf(id), f.ended)
     }
     @Test fun exactDeadlineExpiresOnceAndPublishesIdleToObservers() {
         val f = Fixture(); f.live(); val id = f.life.state.session; f.hide()

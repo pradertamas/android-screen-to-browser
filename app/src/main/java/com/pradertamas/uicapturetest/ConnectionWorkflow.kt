@@ -27,8 +27,10 @@ fun WorkflowStart(allowed: Boolean, path: String?, share: () -> Unit, shareEnabl
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("2. Choose how to start", style = MaterialTheme.typography.titleMedium)
             if (activeShare != null) {
-                Button(onClick = activeShare, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) { Text("Show active share") }
-                TextButton(onClick = stopActiveShare, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
+                val activeShareButtonModifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                Button(onClick = activeShare, modifier = activeShareButtonModifier) { Text("Show active share") }
+                Button(onClick = stopActiveShare, modifier = activeShareButtonModifier,
+                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.error)) {
                     Text("Stop active share")
                 }
                 Text("Stop the active share to start another connection.")

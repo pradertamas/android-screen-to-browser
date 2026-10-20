@@ -30,9 +30,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.pradertamas.uicapturetest.ui.theme.UICaptureTestTheme
 import org.webrtc.SurfaceViewRenderer
 
-/** Foreground-only native receiver. Configuration recreation preserves the ViewModel/peer, replaces only the renderer. */
+/** Receiver viewer only; the process coordinator owns the peer while this Activity is hidden. */
 class ReceiverActivity : ComponentActivity() {
     private val viewerIdentity = Any()
+    private fun traceLifecycle(event: String) = ReceiverSessions.diagnostic(
+        "$event component=ReceiverActivity activity=${System.identityHashCode(viewerIdentity)} task=$taskId finishing=$isFinishing config=$isChangingConfigurations actualRole=${AppMediaRoles.role}")
     companion object { internal const val REQUEST_MEDIA_HANDOFF = "requestMediaHandoff" }
     private fun takeRequestHandoff(value: Intent): String? {
         val id = runCatching { value.getStringExtra(REQUEST_MEDIA_HANDOFF) }.getOrNull()
@@ -53,17 +55,20 @@ class ReceiverActivity : ComponentActivity() {
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        traceLifecycle("onNewIntent")
         val id = takeRequestHandoff(intent); setIntent(intent); deliverRequestHandoff(id)
     }
     private val requestMonitorOwner = ConnectionRequestForegroundOwner()
     private val requestSetupOwner = ConnectionRequestSetupOwner()
     override fun onResume() {
         super.onResume()
+        traceLifecycle("onResume")
         if (::model.isInitialized) model.ensureBoundToTask(taskId)
         ConnectionRequestInitiatorMonitoring.monitor.foreground(requestMonitorOwner, MediaRole.RECEIVE)
         ConnectionRequestSetup.coordinator.foreground(requestSetupOwner, MediaRole.RECEIVE)
     }
     override fun onPause() {
+        traceLifecycle("onPause")
         ConnectionRequestInitiatorMonitoring.monitor.background(requestMonitorOwner)
         ConnectionRequestSetup.coordinator.background(requestSetupOwner)
         super.onPause()
@@ -71,16 +76,17 @@ class ReceiverActivity : ComponentActivity() {
     private lateinit var model: ReceiverViewModel
     override fun onStart() {
         super.onStart()
+        traceLifecycle("onStart")
         if (::model.isInitialized) {
             model.owner.viewerVisible(viewerIdentity)
-            if (AppMediaRoles.role != MediaRole.RECEIVE) { showMain(); return }
+            if (AppMediaRoles.role != MediaRole.RECEIVE) { showMain("role-not-receive"); return }
             renderer?.let(model::attach)
             if (model.state.value.presence.live) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
-    private fun showMain() {
+    private fun showMain(reason: String = "viewer-back-or-stop") {
         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-        finishReceiver()
+        finishReceiver(reason)
     }
     private fun viewerBack() {
         if (::model.isInitialized && model.state.value.presence.live) {
@@ -89,7 +95,8 @@ class ReceiverActivity : ComponentActivity() {
             showMain()
         } else returnToSend(stopActive = true)
     }
-    private fun finishReceiver() {
+    private fun finishReceiver(reason: String = "return-to-send") {
+        traceLifecycle("finish reason=$reason")
         RequestFlowTrace.record(RequestFlowTrace.Event.FINISH_RECEIVER_RETURN,
             if (::model.isInitialized) model.requestIdentity else null,
             AppMediaRoles.role, ConnectionRequests.controller.state.value)
@@ -136,6 +143,7 @@ class ReceiverActivity : ComponentActivity() {
     }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        traceLifecycle("onCreate restored=${savedInstanceState != null}")
         val requestHandoff = takeRequestHandoff(intent)
         RequestMediaLifecycle.coordinator
         overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
@@ -147,22 +155,23 @@ class ReceiverActivity : ComponentActivity() {
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             // Process recreation defaults to SEND; never infer RECEIVE from the restored Activity type.
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-            finishReceiver(); return
+            finishReceiver("onCreate-role-not-receive"); return
         }
         try { model = ViewModelProvider(this)[ReceiverViewModel::class.java] }
-        catch (_: Exception) {
+        catch (e: Exception) {
+            traceLifecycle("viewmodel-failure ${ReceiverTrace.exception(e)}")
             RequestFlowTrace.record(RequestFlowTrace.Event.FALLBACK_VIEWMODEL_FAILED, role = AppMediaRoles.role,
                 state = ConnectionRequests.controller.state.value)
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
             AppMediaRoles.receiverStartFailed()
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-            finishReceiver(); return
+            finishReceiver("viewmodel-failure"); return
         }
         if (!model.ensureBoundToTask(taskId)) {
             RequestFlowTrace.record(RequestFlowTrace.Event.RECEIVER_ATTACH_FAILED, role = AppMediaRoles.role,
                 state = ConnectionRequests.controller.state.value)
             requestHandoff?.let { ConnectionRequestMediaHandoff.process.reject(it, RequestMediaLifecycle.coordinator::requestExit) }
-            finishReceiver(); return
+            finishReceiver("owner-attach-failed"); return
         }
         deliverRequestHandoff(requestHandoff)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -174,6 +183,20 @@ class ReceiverActivity : ComponentActivity() {
             val requestState by ConnectionRequests.controller.state.collectAsState()
             val requestRevision by ConnectionRequests.controller.mediaChanges.collectAsState()
             val lifecycleState by lifecycle.currentStateFlow.collectAsState()
+            var notificationPermissionAsked by rememberSaveable { mutableStateOf(false) }
+            val notificationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+                androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { granted ->
+                if (granted) model.state.value.presence.session?.let {
+                    ReceiverExecutionAnchorService.notificationPermissionGranted(this@ReceiverActivity, it)
+                }
+            }
+            LaunchedEffect(ui.presence.live, lifecycleState) {
+                if (ui.presence.live && lifecycleState == androidx.lifecycle.Lifecycle.State.RESUMED && !notificationPermissionAsked &&
+                    checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    notificationPermissionAsked = true
+                    notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
             LaunchedEffect(requestState, requestRevision, lifecycleState, mediaMode.role) {
                 val s = ConnectionRequests.controller.mediaSnapshot()
                 if (s?.side == ConnectionRequestSide.INITIATOR) startRequestReceiver(ConnectionRequests.controller,
@@ -296,6 +319,7 @@ class ReceiverActivity : ComponentActivity() {
         }
     }
     override fun onStop() {
+        traceLifecycle("onStop")
         if (::model.isInitialized) {
             model.owner.viewerHidden(viewerIdentity, isChangingConfigurations, scanning)
             renderer?.let(model::detach)
@@ -304,6 +328,7 @@ class ReceiverActivity : ComponentActivity() {
         super.onStop()
     }
     override fun onDestroy() {
+        traceLifecycle("onDestroy")
         if (::model.isInitialized) renderer?.let(model::detach); renderer = null
         if (::model.isInitialized) model.owner.viewerDestroyed(viewerIdentity, isChangingConfigurations)
         super.onDestroy()

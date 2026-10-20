@@ -52,6 +52,7 @@ class RequestMediaTest {
         var cancels = 0; var withdraws = 0; var creates = 0
         var exitError: ConnectionRequestError? = null
         var onCancel: (() -> Unit)? = null
+        var onStatus: (() -> Unit)? = null
         val now = Instant.parse("2026-01-01T00:00:00Z")
         fun metadata(id: String) = ConnectionRequestMetadata(id, server, now, role, now, now.plusSeconds(300),
             acceptedAt = now, connectBy = now.plusSeconds(120), assignment = assignment)
@@ -62,7 +63,10 @@ class RequestMediaTest {
                 return ConnectionRequestResult(m, httpStatus = 201, created = ConnectionRequestCreated(m,
                     ConnectionCredential(token(30, 32)), ConnectionCredential(token(31))))
             }
-            override fun status(id: String, auth: ConnectionCredential, scope: ConnectionRequestAuthScope) = ConnectionRequestResult(metadata(id))
+            override fun status(id: String, auth: ConnectionCredential, scope: ConnectionRequestAuthScope): ConnectionRequestResult {
+                onStatus?.also { onStatus = null }?.invoke()
+                return ConnectionRequestResult(metadata(id))
+            }
             override fun accept(id: String, capability: ConnectionCredential, claim: ConnectionCredential): ConnectionRequestResult {
                 server = ConnectionRequestState.ACCEPTED; return ConnectionRequestResult(metadata(id), httpStatus = 200)
             }
@@ -97,10 +101,135 @@ class RequestMediaTest {
         }
     }
     private class Socket : ProtectedSocket {
-        val sent = mutableListOf<String>(); var closes = 0
-        override fun send(text: String): Boolean { sent.add(text); return true }
+        val sent = mutableListOf<String>(); var closes = 0; var accepts = true; var throwOnSend = false
+        override fun send(text: String): Boolean { sent.add(text); check(!throwOnSend); return accepts }
         override fun close(code: Int) { closes++ }
         override fun cancel() {}
+    }
+    @Test fun endedReceiverReleasesLocalOwnershipEvenWhenExitNetworkFailsAndRequestStillSaysConnecting() {
+        val r = ReceiverFixture(true); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+        r.live(); r.f.exitError = ConnectionRequestError.NETWORK
+        r.mediaFailure!!(); life.changed(); r.f.worker.run(); life.changed()
+        assertEquals(ReceiverPhase.ERROR, r.engine.home.phase); assertFalse(r.owner.active)
+        assertNull(r.f.controller.mediaSnapshot()); assertTrue(r.f.controller.state.value.idle)
+        assertEquals(1, releases); repeat(3) { life.changed() }; assertEquals(1, releases)
+        r.f.server = ConnectionRequestState.WAITING; r.f.assignment = null
+        val recipients = ConnectionRequestRecipientCoordinator(r.f.controller, { true }, {}, { true }, { releases++ })
+        val fresh = ConnectionRequestLink.build(ConnectionRequestShareData(token(2), token(32), MediaRole.SEND))!!
+        assertNotNull(recipients.open(fresh).flow)
+        r.f.worker.run(); recipients.onControllerState(r.f.controller.state.value)
+        assertEquals(RecipientScreen.WAITING, recipients.state.value.screen)
+    }
+    @Test fun endedReceiverExplicitStopAndNetworkGraceReleaseStaleConnectingOwnership() {
+        for (networkGrace in listOf(false, true)) {
+            val r = ReceiverFixture(true); var releases = 0
+            val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+            r.live(); r.f.exitError = ConnectionRequestError.NETWORK
+            if (networkGrace) {
+                r.engine.connection("DISCONNECTED")
+                r.scheduled.values.single { it.first == ReceiverEngine.GRACE_MS }.second()
+            } else r.owner.stop(r.flow)
+            life.changed(); r.f.worker.run(); life.changed()
+            assertFalse(r.owner.active); assertEquals(1, r.disposed)
+            assertNull(r.f.controller.mediaSnapshot()); assertEquals(1, releases)
+        }
+    }
+    @Test fun terminalUnacceptedPreviewDoesNotKeepRequestOwnership() {
+        val f = Fixture(); var releases = 0
+        val a = f.controller.preview(token(1), token(31), MediaRole.SEND)!!
+        f.server = ConnectionRequestState.EXPIRED; f.controller.refreshStatus(a); f.worker.run()
+        val life = ConnectionRequestMediaLifecycle(f.controller) { releases++ }; life.changed()
+        assertTrue(f.controller.state.value.idle); assertNull(f.controller.recipientAccess(a))
+        assertEquals(1, releases)
+    }
+    @Test fun noContextFinishRetiresDeadFlowButCannotReleaseReplacementOrActiveRequest() {
+        val r = ReceiverFixture(true); var releases = 0
+        val recipients = ConnectionRequestRecipientCoordinator(r.f.controller, { true }, {}, { true }, { releases++ })
+        r.live(); r.owner.stop(r.flow); r.f.exitError = ConnectionRequestError.NETWORK
+        recipients.finishWithoutContext(null)
+        assertNull(r.f.controller.mediaSnapshot()); assertEquals(1, releases)
+        r.f.worker.run(); assertTrue(r.f.controller.state.value.idle)
+        r.f.server = ConnectionRequestState.WAITING; r.f.assignment = null
+        val link = ConnectionRequestLink.build(ConnectionRequestShareData(token(2), token(32), MediaRole.SEND))!!
+        val b = recipients.open(link).flow!!; r.f.worker.run()
+        val current = r.f.controller.state.value
+        recipients.finishWithoutContext(r.flow as ConnectionRequestRecipientFlow)
+        recipients.finishWithoutContext(null)
+        assertSame(b, r.f.controller.mediaSnapshot()!!.flow)
+        assertEquals(current, r.f.controller.state.value); assertEquals(1, releases)
+        assertEquals(RecipientEntryError.CONFLICT, recipients.open(link).error)
+    }
+    @Test fun endedReceiverRetirementInvalidatesInFlightStatusAndLateCallbacksCannotReclaimOwnership() {
+        val r = ReceiverFixture(true); var releases = 0
+        val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+        val recipients = ConnectionRequestRecipientCoordinator(r.f.controller, { true }, {}, { true }, { releases++ })
+        r.live(); r.f.exitError = ConnectionRequestError.NETWORK
+        var b: ConnectionRequestRecipientFlow? = null
+        r.f.onStatus = {
+            r.owner.stop(r.flow); life.changed() // Old STATUS is currently executing outside the lock.
+            assertNull(r.f.controller.mediaSnapshot())
+            r.f.server = ConnectionRequestState.WAITING; r.f.assignment = null
+            b = recipients.open(ConnectionRequestLink.build(ConnectionRequestShareData(token(2), token(32), MediaRole.SEND))).flow
+        }
+        r.f.controller.refreshStatus(r.flow as ConnectionRequestRecipientFlow); r.f.worker.run()
+        assertNotNull(b); assertSame(b, r.f.controller.mediaSnapshot()!!.flow)
+        assertEquals(ConnectionRequestState.WAITING, r.f.controller.state.value.request?.state)
+        val current = r.f.controller.state.value
+        life.requestExit(r.flow); life.changed(); recipients.close(r.flow)
+        r.f.controller.refreshStatus(r.flow); r.f.worker.run()
+        assertFalse(r.f.controller.finishMediaFlow(r.flow) { releases++ })
+        assertEquals(current, r.f.controller.state.value); assertEquals(1, releases)
+    }
+    @Test fun realSetupReservationAndStartedMediaRemainProtectedFromSecondLink() {
+        val f = Fixture(); val a = f.initiator()
+        val recipients = ConnectionRequestRecipientCoordinator(f.controller, { true }, {}, { true }, { error("live release") })
+        val link = ConnectionRequestLink.build(ConnectionRequestShareData(token(2), token(32), MediaRole.SEND))!!
+        fun protected() {
+            val current = f.controller.state.value
+            assertFalse(f.controller.finishMediaFlow(a) { error("live release") })
+            assertEquals(RecipientEntryError.CONFLICT, recipients.open(link).error)
+            assertEquals(current, f.controller.state.value); assertSame(a, f.controller.mediaSnapshot()!!.flow)
+        }
+        protected()
+        val handoff = f.handoffs.reserve(a, MediaRole.SEND)!!; protected()
+        f.handoffs.consume(handoff, MediaRole.SEND)!!; protected()
+        val r = ReceiverFixture(true); r.live()
+        r.factory.listener.failed(); r.q.run() // Degraded signaling is still a REAL live media owner.
+        assertFalse(r.f.controller.finishMediaFlow(r.flow) { error("live release") })
+        assertFalse(r.f.controller.clearRecipient(r.flow as ConnectionRequestRecipientFlow) { error("live release") })
+        assertTrue(r.owner.active); assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+    }
+    @Test fun completedOrTerminalReceiverReleasesExactlyOnceOnlyAfterMediaDisposal() {
+        for (state in listOf(ConnectionRequestState.CONNECTED, ConnectionRequestState.FAILED,
+            ConnectionRequestState.CANCELED, ConnectionRequestState.EXPIRED)) {
+            val r = ReceiverFixture(true); var releases = 0
+            val life = ConnectionRequestMediaLifecycle(r.f.controller) { releases++ }
+            r.live(); r.f.server = state
+            if (state.terminal) r.f.assignment = null
+            r.f.controller.refreshStatus(r.flow as ConnectionRequestRecipientFlow); r.f.worker.run()
+            life.changed(); assertTrue(r.owner.active); assertEquals(0, releases)
+            r.owner.stop(r.flow); life.changed(); life.changed()
+            assertFalse(r.owner.active); assertEquals(ReceiverPhase.ENDED, r.engine.home.phase)
+            assertEquals(1, releases); assertNull(r.f.controller.mediaSnapshot())
+            assertFalse(r.f.controller.finishMediaFlow(r.flow) { releases++ }); assertEquals(1, releases)
+        }
+    }
+    @Test fun concurrentRetirementReleasesAndQueuesOldServerExitExactlyOnce() {
+        val f = Fixture(); val flow = f.initiator()
+        val handoff = f.handoffs.reserve(flow, MediaRole.SEND)!!
+        val owner = f.handoffs.consume(handoff, MediaRole.SEND)!!.owner
+        f.handoffs.disposed(owner); f.exitError = ConnectionRequestError.NETWORK
+        val start = CountDownLatch(1); val won = AtomicInteger(); val releases = AtomicInteger()
+        val threads = List(2) { Thread {
+            start.await()
+            if (f.controller.finishMediaFlow(flow) { releases.incrementAndGet() }) won.incrementAndGet()
+        } }
+        threads.forEach(Thread::start); start.countDown(); threads.forEach { it.join(2000); assertFalse(it.isAlive) }
+        assertEquals(1, won.get()); assertEquals(1, releases.get()); assertEquals(1, f.worker.tasks.size)
+        f.worker.run(); assertEquals(1, f.cancels); assertTrue(f.controller.state.value.idle)
+        f.handoffs.disposed(owner) // Duplicate acknowledgement cannot restore retired ownership.
+        assertNull(f.controller.mediaSnapshot()); assertEquals(1, releases.get())
     }
     private class Factory : ProtectedSocketFactory {
         val socket = Socket(); lateinit var listener: ProtectedSocketListener; var opens = 0
@@ -118,6 +247,31 @@ class RequestMediaTest {
         override fun peerPresent() { order.add("peer") }
         override fun payload(text: String) { order.add(JSONObject(text).getString("type")) }
         override fun ended() { order.add("ended") }
+    }
+    @Test fun protectedSenderDiagnosticsIdentifyOriginBeforeExistingCloseAndKeepExactlyOneEnd() {
+        for ((trigger, expected) in listOf("bye" to "SIGNALING_REMOTE_BYE", "peer-left" to "SIGNALING_PEER_LEFT",
+            "failure" to "SIGNALING_FAILURE", "remote-close" to "SIGNALING_REMOTE_CLOSE", "send-failure" to "SIGNALING_SEND_FAILURE")) {
+            val f = Fixture(); val b = f.controller.protectedSignalingBootstrap(f.initiator())!!
+            val factory = Factory(); val q = Queue(); val origins = mutableListOf<Pair<String, Int>>(); var ended = 0
+            val channel = ProtectedSenderSignalingChannel(b, factory, q::dispatch)
+            channel.open(object : SenderSignalingEvents {
+                override fun registered() {}
+                override fun peerPresent() {}
+                override fun payload(text: String) {}
+                override fun terminalOrigin(source: String) { origins.add(source to factory.socket.closes) }
+                override fun ended() { ended++ }
+            })
+            factory.register(MediaRole.SEND, PairingIntent.CREATE); q.run()
+            when (trigger) {
+                "failure" -> factory.listener.failed()
+                "remote-close" -> factory.listener.closed(1000)
+                "send-failure" -> { factory.socket.accepts = false; assertFalse(channel.send("""{"type":"offer","sdp":"synthetic"}""")) }
+                else -> factory.text(trigger)
+            }
+            q.run(); factory.listener.failed(); q.run()
+            assertEquals(expected, origins.first().first); assertEquals(0, origins.first().second)
+            assertEquals(1, ended)
+        }
     }
     @Test fun handoffIsOneShotAndFresh() {
         val f = Fixture(); val a = f.initiator(); val id = f.handoffs.reserve(a, MediaRole.SEND)!!
@@ -222,6 +376,207 @@ class RequestMediaTest {
         val owner = RequestReceiverOwner(engine, router, f.handoffs, q::dispatch, factory)
         fun start() { assertTrue(owner.start(f.handoffs.reserve(flow, MediaRole.RECEIVE)!!)) }
         fun register() { factory.register(MediaRole.RECEIVE, if (flow is ConnectionRequestRecipientFlow) PairingIntent.JOIN else PairingIntent.CREATE); q.run() }
+        fun live() {
+            start(); register(); factory.text("peer-present"); q.run()
+            factory.listener.text("""{"type":"offer","sdp":"live"}"""); q.run()
+            engine.connection("CONNECTED"); engine.firstFrame()
+        }
+    }
+    @Test fun establishedReceiverRetainsMediaWhenProtectedSocketFails() {
+        val r = ReceiverFixture(true); r.live()
+        val mediaHome = r.engine.home
+        r.factory.listener.failed(); r.q.run()
+        assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+        assertFalse(r.engine.home.signalingAvailable); assertFalse(r.engine.hasSignaling)
+        assertTrue(r.owner.active); assertEquals(0, r.disposed)
+        assertEquals(RequestMediaPhase.STARTED, r.f.controller.mediaPhaseForFlow(r.flow))
+        // A late local ICE callback must not turn degraded signaling into media teardown.
+        r.localIce!!(ReceiverIce("0", 0, "late-candidate")); r.q.run()
+        assertEquals(mediaHome.phase, r.engine.home.phase)
+        assertEquals(1, r.factory.opens); assertEquals(1, r.media)
+        assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+    }
+    @Test fun establishedReceiverStillHonorsExplicitByeAndRejectsProtocolViolations() {
+        val endings: List<(ReceiverFixture) -> Unit> = listOf(
+            { it.factory.text("bye") },
+            { it.factory.listener.text("""{"type":"answer","sdp":"invalid"}""") },
+            { it.factory.listener.text("malformed-json") }, { it.factory.listener.binary() },
+            { it.factory.listener.closed(1008) })
+        for (end in endings) {
+            val r = ReceiverFixture(true); r.live(); end(r); r.q.run()
+            assertFalse(r.owner.active); assertEquals(1, r.disposed)
+            assertEquals(1, r.factory.opens); assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+        }
+    }
+    @Test fun establishedReceiverNormalSocketCloseRetainsMedia() {
+        val r = ReceiverFixture(true); r.live(); r.factory.listener.closed(1000); r.q.run()
+        assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+        assertFalse(r.engine.home.signalingAvailable); assertTrue(r.owner.active)
+        assertEquals(0, r.disposed); assertEquals(1, r.factory.opens)
+    }
+    @Test fun receiverPeerLeftRetainsEstablishedOwnerButTerminatesSetup() {
+        for (live in listOf(false, true)) {
+            val r = ReceiverFixture(true)
+            if (live) r.live() else { r.start(); r.register() }
+            r.factory.text("peer-left"); r.q.run()
+            assertEquals(live, r.owner.active)
+            assertEquals(0, r.disposed) // Setup has not created a peer.
+            if (live) {
+                assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+                assertFalse(r.engine.home.signalingAvailable)
+                assertEquals(RequestMediaPhase.STARTED, r.f.controller.mediaPhaseForFlow(r.flow))
+                assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+                r.engine.connection("FAILED"); assertEquals(1, r.disposed)
+            }
+        }
+    }
+    @Test fun intentionalReceiverStopAttemptsByeOnceAndDisposesEvenWhenSendFails() {
+        for (available in listOf(false, true)) for (accepts in listOf(false, true)) {
+            val r = ReceiverFixture(true); r.live()
+            if (!available) { r.factory.listener.failed(); r.q.run() }
+            r.factory.socket.accepts = accepts
+            val before = r.factory.socket.sent.count { JSONObject(it).optString("type") == "bye" }
+            r.engine.stop("user-stop-active-share", intentional = true); r.q.run()
+            r.engine.stop("user-stop-active-share", intentional = true); r.q.run()
+            assertEquals(before + if (available) 1 else 0,
+                r.factory.socket.sent.count { JSONObject(it).optString("type") == "bye" })
+            assertFalse(r.owner.active); assertEquals(1, r.disposed); assertEquals(1, r.factory.opens)
+        }
+    }
+    @Test fun throwingByeSendCannotPreventImmediateReceiverDisposal() {
+        val r = ReceiverFixture(true); r.live(); r.factory.socket.throwOnSend = true
+        r.engine.stop("user-stop-active-share", intentional = true); r.q.run()
+        assertFalse(r.owner.active); assertEquals(1, r.disposed)
+    }
+    @Test fun protectedSenderDeliversDistinctOperationalCausesBeforeMediaDecision() {
+        for (connected in listOf(false, true)) for (cause in listOf("peer-left", "failure", "close", "bye", "protocol", "send")) {
+            val f = Fixture(); val bootstrap = f.controller.protectedSignalingBootstrap(f.initiator())!!
+            val factory = Factory(); val q = Queue(); val policy = SenderMediaSignalingPolicy()
+            val decisions = mutableListOf<Pair<String, Boolean>>()
+            val channel = ProtectedSenderSignalingChannel(bootstrap, factory, q::dispatch)
+            channel.open(object : SenderSignalingEvents {
+                override fun registered() {}
+                override fun peerPresent() {}
+                override fun payload(text: String) {}
+                override fun ended() { error("Cause must not be collapsed") }
+                override fun signalingEnded(source: String) {
+                    decisions.add(source to policy.retain(source, if (connected) "CONNECTED" else "CONNECTING"))
+                }
+            })
+            factory.register(MediaRole.SEND, PairingIntent.CREATE); q.run()
+            if (connected) policy.connected()
+            when (cause) {
+                "peer-left" -> factory.text("peer-left")
+                "failure" -> factory.listener.failed()
+                "close" -> factory.listener.closed(1000)
+                "bye" -> factory.text("bye")
+                "protocol" -> factory.listener.binary()
+                "send" -> { factory.socket.accepts = false; assertFalse(channel.send("""{"type":"ice","candidate":{"candidate":"x","sdpMid":"0","sdpMLineIndex":0}}""")) }
+            }
+            q.run()
+            assertEquals(1, decisions.size)
+            assertEquals(connected && cause !in listOf("bye", "protocol"), decisions.single().second)
+            if (cause == "bye") assertEquals("SIGNALING_REMOTE_BYE", decisions.single().first)
+            if (cause == "protocol") assertEquals("SIGNALING_PROTOCOL_FAILURE", decisions.single().first)
+            // A disposed signaling transport cannot deliver stale events into this or a replacement owner.
+            factory.text("bye"); factory.listener.failed(); q.run(); assertEquals(1, decisions.size)
+        }
+    }
+    @Test fun firstFrameWithoutConfirmedConnectedPeerDoesNotMaskSocketFailure() {
+        val r = ReceiverFixture(true); r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"offer"}"""); r.q.run(); r.engine.firstFrame()
+        r.factory.listener.failed(); r.q.run()
+        assertFalse(r.owner.active); assertEquals(1, r.disposed)
+        assertEquals("signaling-unavailable-during-setup", r.engine.lastCloseReason)
+    }
+    @Test fun failedSignalingSendUsesSameEstablishedMediaPolicyAndKeepsSetupErrorSemantics() {
+        for (live in listOf(false, true)) {
+            val r = ReceiverFixture(true); r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+            r.factory.listener.text("""{"type":"offer","sdp":"offer"}"""); r.q.run()
+            r.engine.connection("CONNECTED"); if (live) r.engine.firstFrame()
+            r.factory.socket.accepts = false
+            r.localIce!!(ReceiverIce("0", 0, "late-candidate")); r.q.run()
+            if (live) {
+                assertTrue(r.owner.active); assertEquals(0, r.disposed)
+                assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+                assertFalse(r.engine.home.signalingAvailable)
+                val sent = r.factory.socket.sent.size
+                r.localIce!!(ReceiverIce("0", 0, "later-candidate")); r.q.run()
+                assertEquals(sent, r.factory.socket.sent.size)
+            } else {
+                assertFalse(r.owner.active); assertEquals(1, r.disposed)
+                assertEquals(ReceiverPhase.ERROR, r.engine.home.phase)
+            }
+            assertEquals(1, r.factory.opens)
+        }
+    }
+    @Test fun peerCanRecoverWithinItsOwnGraceWithoutRestoringLostSignaling() {
+        val r = ReceiverFixture(true); r.live(); r.factory.listener.failed(); r.q.run()
+        r.engine.connection("DISCONNECTED")
+        assertEquals(1, r.scheduled.values.count { it.first == ReceiverEngine.GRACE_MS })
+        r.engine.connection("CONNECTED")
+        assertTrue(r.scheduled.isEmpty()); assertTrue(r.owner.active)
+        assertFalse(r.engine.home.signalingAvailable); assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase)
+        assertEquals(0, r.disposed); assertEquals(1, r.factory.opens); assertEquals(1, r.media)
+    }
+    @Test fun establishedReceiverSocketLossKeepsBackgroundDeadlineAndSameSessionOnReturn() {
+        val r = ReceiverFixture(true); var now = 0L; val timers = mutableListOf<() -> Unit>()
+        val life = ReceiverVisibility({ now }, { _, action -> timers.add(action); {} }, {}, { r.owner.stop(r.flow) })
+        r.onHome = { life.connection(it.phase) }; val receiver = Any(); life.visible(receiver)
+        r.live(); val id = life.state.session
+        val renderer = Any(); var attached = 0; var detached = 0
+        val binding = ReceiverRendererBinding<Any>({ attached++ }, { detached++ })
+        binding.attach(renderer); life.hidden(receiver, false); binding.detach(renderer)
+        now = 5000; r.factory.listener.failed(); r.q.run()
+        assertTrue(life.state.live); assertEquals(60000L, life.state.absentUntilElapsed)
+        assertEquals(1, timers.size); assertEquals(0, r.disposed)
+        // MainActivity can present the same live identity, then ReceiverActivity reattaches.
+        now = 20000; life.visible(Any())
+        assertTrue(life.matches(id!!)); assertTrue(ReceiverUi(r.engine.home, presence = life.state).active)
+        life.visible(receiver); binding.attach(renderer)
+        now = 60000; timers.forEach { it() }
+        assertSame(id, life.state.session); assertTrue(life.state.live)
+        assertEquals(2, attached); assertEquals(1, detached)
+        assertEquals(1, r.factory.opens); assertEquals(1, r.media); assertEquals(0, r.disposed)
+    }
+    @Test fun establishedReceiverWithLostSignalingStillExpiresOnceAfterSixtySeconds() {
+        val r = ReceiverFixture(true); var now = 0L; var expiries = 0; val timers = mutableListOf<() -> Unit>()
+        val life = ReceiverVisibility({ now }, { _, action -> timers.add(action); {} }, {}, {
+            expiries++; r.owner.stop(r.flow)
+        })
+        r.onHome = { life.connection(it.phase) }; val viewer = Any(); life.visible(viewer)
+        r.live(); life.hidden(viewer, false)
+        now = 5000; r.factory.listener.failed(); r.q.run()
+        now = 59999; assertFalse(life.checkExpiry()); assertTrue(r.owner.active)
+        now = 60000; timers.forEach { it() }; timers.forEach { it() }; life.checkExpiry()
+        assertEquals(1, expiries); assertEquals(1, r.disposed); assertFalse(r.owner.active)
+        assertFalse(life.state.live); assertEquals(1, r.factory.opens)
+    }
+    @Test fun establishedReceiverSocketLossDoesNotReplacePeerDisconnectGrace() {
+        for (socketFirst in listOf(true, false)) {
+            val r = ReceiverFixture(true); r.live()
+            if (socketFirst) { r.factory.listener.failed(); r.q.run() }
+            r.engine.connection("DISCONNECTED")
+            if (!socketFirst) { r.factory.listener.failed(); r.q.run() }
+            assertTrue(r.owner.active); assertEquals(0, r.disposed)
+            val grace = r.scheduled.values.single { it.first == ReceiverEngine.GRACE_MS }.second
+            grace(); grace()
+            assertFalse(r.owner.active); assertEquals(1, r.disposed)
+            assertEquals("network-grace-expired", r.engine.lastCloseReason)
+            assertEquals(1, r.factory.opens); assertEquals(0, r.f.withdraws); assertEquals(0, r.f.cancels)
+        }
+        val r = ReceiverFixture(true); r.live(); r.factory.listener.failed(); r.q.run()
+        r.engine.connection("FAILED")
+        assertFalse(r.owner.active); assertEquals(1, r.disposed); assertEquals("peer-FAILED", r.engine.lastCloseReason)
+    }
+    @Test fun connectingReceiverSocketFailureStillEndsSetup() {
+        val r = ReceiverFixture(true); r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
+        r.factory.listener.text("""{"type":"offer","sdp":"setup"}"""); r.q.run()
+        r.engine.connection("CONNECTED") // Peer connected but no first rendered frame yet.
+        r.factory.listener.failed(); r.q.run()
+        assertFalse(r.owner.active); assertEquals(1, r.disposed)
+        assertEquals(ReceiverPhase.ENDED, r.engine.home.phase)
+        assertEquals(1, r.factory.opens); assertEquals(0, r.f.withdraws); assertEquals(0, r.f.cancels)
     }
     @Test fun requestCreateReceiverDoesNotGenerateRotateOrOffer() {
         val r = ReceiverFixture(); r.start(); r.register()
@@ -266,18 +621,43 @@ class RequestMediaTest {
         assertTrue(r.owner.active); assertEquals(1, r.media); assertEquals(1, r.factory.opens)
         assertEquals(0, r.disposed); assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
     }
-    @Test fun networkGraceCanEndHiddenReceiverBeforeUiGraceAndOnlyDisposeOnce() {
+    @Test fun backgroundStartedDisconnectRetainsOwnerUntilUiGraceAndOnlyDisposesOnce() {
         val r = ReceiverFixture(true); var now = 0L; val uiTimers = mutableListOf<() -> Unit>(); var expiries = 0
-        val life = ReceiverVisibility({ now }, { _, action -> uiTimers.add(action); {} }, {}, { expiries++; r.owner.stop(r.flow) })
+        val gate = LegacyConnectionStartGate(); gate.armRequestFirst(); var releases = 0
+        val cleanup = ConnectionRequestMediaLifecycle(r.f.controller) { releases++; gate.releaseRequestFirst() }
+        var published = ReceiverUi(); var anchorStarts = 0; var anchorStops = 0
+        val anchor = ReceiverAnchorLifecycle({ key -> published.presence.live &&
+            published.presence.session?.anchorKey == key && r.owner.active }, {}, { false }, { anchorStops++ })
+        val admission = ReceiverAnchorAdmission { id -> anchorStarts++; anchor.command("START", id.anchorKey, anchorStarts) }
+        val life = ReceiverVisibility({ now }, { _, action -> uiTimers.add(action); {} }, { p ->
+            r.engine.mediaAuthority(r.engine.mediaAttempt, receiverMediaAuthority(p, now))
+            published = ReceiverUi(r.engine.home, presence = p)
+            admission.changed(published, MediaRole.RECEIVE, r.engine.hasMedia); anchor.changed()
+        }, { expiries++; r.owner.stop(r.flow) })
         r.onHome = { life.connection(it.phase) }; val viewer = Any(); life.visible(viewer)
-        r.start(); r.register(); r.factory.text("peer-present"); r.q.run()
-        r.factory.listener.text("""{"type":"offer","sdp":"live"}"""); r.q.run(); r.engine.firstFrame(); life.hidden(viewer, false)
+        r.live(); val identity = life.state.session; life.hidden(viewer, false)
         repeat(3) { r.engine.connection("DISCONNECTED") }
-        assertEquals(1, r.scheduled.values.count { it.first == 4000L })
-        r.scheduled.values.single { it.first == 4000L }.second()
-        assertEquals(ReceiverPhase.ERROR, r.engine.home.phase); assertFalse(r.owner.active); assertEquals(1, r.disposed)
-        now = 60000; uiTimers.forEach { it() }; assertEquals(0, expiries)
+        now = 25000; cleanup.changed()
+        assertEquals(0, r.scheduled.values.count { it.first == 4000L })
+        assertEquals(ReceiverPhase.RECEIVING, r.engine.home.phase); assertTrue(r.owner.active); assertEquals(0, r.disposed)
+        assertSame(identity, life.state.session); assertTrue(ReceiverUi(r.engine.home, presence = life.state).active)
+        assertEquals(RequestMediaPhase.STARTED, r.f.controller.mediaPhaseForFlow(r.flow))
+        assertFalse(r.owner.start("second-handoff")); assertNull(r.f.controller.create(MediaRole.SEND))
+        assertFalse(gate.legacyStartAllowed()); assertEquals(0, releases)
+        assertEquals(1, anchorStarts); assertEquals(0, anchorStops); assertEquals(identity!!.anchorKey, anchor.key)
+        now = 60000; uiTimers.forEach { it() }; uiTimers.forEach { it() }; cleanup.changed(); cleanup.changed()
+        assertEquals(1, expiries); assertEquals(1, r.disposed); assertFalse(r.owner.active)
+        assertEquals(1, releases); assertTrue(gate.legacyStartAllowed()); assertNull(r.f.controller.mediaSnapshot())
+        assertEquals(1, anchorStops); assertNull(anchor.key)
         assertEquals(0, r.f.cancels); assertEquals(0, r.f.withdraws)
+    }
+    @Test fun retainedBackgroundStillHonorsAuthenticatedByeAndProtocolFailure() {
+        for (protocol in listOf(false, true)) {
+            val r = ReceiverFixture(true); r.live()
+            r.engine.mediaAuthority(r.engine.mediaAttempt, ReceiverMediaAuthority.BACKGROUND); r.engine.connection("DISCONNECTED")
+            if (protocol) r.factory.listener.binary() else r.factory.text("bye")
+            r.q.run(); assertFalse(r.owner.active); assertEquals(1, r.disposed)
+        }
     }
     @Test fun receiverNavigationRequiresEffectiveReceiveRoleBeforeDispatch() {
         val r = ReceiverFixture(true); var navigations = 0
